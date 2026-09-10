@@ -1,0 +1,250 @@
+                lastCleanup = now;
+            }
+            List<Punishment> active = database.getAllActiveNetwork(now);
+            Map<String, Punishment> byUuid = new HashMap<>();
+            Map<String, Punishment> byName = new HashMap<>();
+            for (Punishment p : active) {
+                if (p.targetUuid != null) byUuid.merge(p.targetUuid.toString(), p, WorldsGreatestModeration::stronger);
+                byName.merge(p.targetKey(), p, WorldsGreatestModeration::stronger);
+            }
+            Map<UUID, Punishment> newMutes = new HashMap<>();
+            List<KickPlan> kicks = new ArrayList<>();
+            for (OnlineRef ref : online) {
+                Punishment p = byUuid.get(ref.uuid.toString());
+                if (p == null) p = byName.get(ref.name.toLowerCase(Locale.ROOT));
+                if (p == null) continue;
+                if (p.type.equals("BLACKLIST") || p.type.equals("BAN")) {
+                    kicks.add(new KickPlan(ref.uuid, p.type.equals("BLACKLIST") ? blacklistMessage(p, false) : banMessage(p, false)));
+                } else if (p.type.equals("MUTE")) {
+                    newMutes.put(ref.uuid, p);
+                }
+            }
+            Set<UUID> onlineIds = new HashSet<>(); for (OnlineRef ref : online) onlineIds.add(ref.uuid);
+            for (UUID id : onlineIds) {
+                Punishment mute = newMutes.get(id);
+                if (mute == null) muteCache.remove(id); else muteCache.put(id, mute);
+            }
+            if (!kicks.isEmpty()) sync(() -> {
+                for (KickPlan plan : kicks) {
+                    Player player = Bukkit.getPlayer(plan.uuid);
+                    if (player != null) kickRich(player, plan.message);
+                }
+            });
+            pollAltAlerts(now);
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "Network moderation refresh failed", t);
+        }
+    }
+
+    private static Punishment stronger(Punishment a, Punishment b) {
+        return rank(a.type) >= rank(b.type) ? a : b;
+    }
+
+    private static int rank(String type) {
+        return switch (type) { case "BLACKLIST" -> 4; case "BAN" -> 3; case "MUTE" -> 2; default -> 1; };
+    }
+
+    private void pollAltAlerts(long now) throws SQLException {
+        for (ModEvent e : database.eventsSince(now - 10_000L)) {
+            if (!seenEventIds.add(e.id)) continue;
+            seenEventTimes.put(e.id, now);
+            if (e.type.equals("ALT_ACTION") || e.type.equals("ALT_SUSPECT")) {
+                boolean suspect = e.type.equals("ALT_SUSPECT");
+                sync(() -> {
+                    for (Player p : Bukkit.getOnlinePlayers()) {
+                        if (shouldReceiveAlert(p)) p.sendMessage(PREFIX + (suspect ? "§6§lALT REVIEW " : "§c§lALT DETECTION ") + "§8• §f" + e.payload.replace("|", " §8• §f"));
+                    }
+                });
+            } else if (e.type.equals("NETWORK_KICK") || e.type.equals("NETWORK_WARN")) {
+                Punishment action = database.findPunishmentById(e.payload);
+                if (action != null) applyImmediate(action);
+            }
+        }
+        if (seenEventIds.size() > 2000) {
+            for (Map.Entry<String, Long> e : new ArrayList<>(seenEventTimes.entrySet())) {
+                if (now - e.getValue() > 60_000L) { seenEventIds.remove(e.getKey()); seenEventTimes.remove(e.getKey()); }
+            }
+        }
+    }
+
+    private AltDecision evaluateAlt(UUID altUuid, String altName, String ipHash, String networkHash, String fingerprint, String clientTokenHash,
+                                    boolean preLogin, boolean knownBeforeLogin, long loginAt, String addressScope, boolean forwarded) throws SQLException {
+        if (settings.altMode.equals("OFF") || altUuid == null) return null;
+        List<IdentityCandidate> identities = database.findIdentityCandidates(altUuid, ipHash, networkHash, fingerprint, clientTokenHash);
+        AltDecision best = null;
+        long now = System.currentTimeMillis();
+
+        for (IdentityCandidate identity : identities) {
+            if (identity.uuid == null || identity.uuid.equals(altUuid)) continue;
+            Punishment matchedSanction = database.findStrongestActive(identity.uuid, identity.username, Set.of("BLACKLIST", "BAN"), now);
+            if (matchedSanction == null) continue;
+
+            Punishment rootSanction = database.resolveRootPunishment(matchedSanction);
+            UUID rootUuid = rootSanction.targetUuid != null ? rootSanction.targetUuid : identity.uuid;
+            String rootName = rootSanction.targetName == null || rootSanction.targetName.isBlank() ? identity.username : rootSanction.targetName;
+
+            boolean sameIp = ipHash != null && database.hasIp(identity.uuid, ipHash);
+            boolean sameNetwork = networkHash != null && database.hasNetwork(identity.uuid, networkHash);
+            boolean sameFingerprint = fingerprint != null && database.hasFingerprint(identity.uuid, fingerprint);
+            boolean sameClientToken = clientTokenHash != null && database.hasClientToken(identity.uuid, clientTokenHash);
+            int fingerprintPopulation = sameFingerprint ? database.fingerprintAccountCount(fingerprint) : 0;
+            boolean distinctiveFingerprint = sameFingerprint && fingerprintPopulation > 0 && fingerprintPopulation <= 4;
+            boolean historicalConcurrency = database.hasHistoricalConcurrency(identity.uuid, altUuid, rootSanction.createdAt);
+            int commonIps = database.commonIpCount(identity.uuid, altUuid);
+            int commonNetworks = database.commonNetworkCount(identity.uuid, altUuid);
+            boolean priorLink = database.hasEvasionLink(rootUuid, altUuid) || database.hasEvasionLink(identity.uuid, altUuid);
+            long altFirstSeen = database.firstSeen(altUuid);
+            boolean existedBeforeSanction = knownBeforeLogin && altFirstSeen > 0L && altFirstSeen + 2_000L < rootSanction.createdAt;
+            boolean freshAccount = !knownBeforeLogin;
+            long sinceSanction = loginAt - rootSanction.createdAt;
+            boolean rapid = sinceSanction >= -2_000L && sinceSanction <= 12L * 60L * 60L * 1000L;
+            boolean veryRapid = sinceSanction >= -2_000L && sinceSanction <= 30L * 60L * 1000L;
+            long ipLastSeen = sameIp ? Math.max(database.lastSeenOnIp(identity.uuid, ipHash), database.lastSeenOnIp(rootUuid, ipHash)) : 0L;
+            long networkLastSeen = sameNetwork ? Math.max(database.lastSeenOnNetwork(identity.uuid, networkHash), database.lastSeenOnNetwork(rootUuid, networkHash)) : 0L;
+            boolean recentSameIpOwner = ipLastSeen > 0L && loginAt >= ipLastSeen && loginAt - ipLastSeen <= 30L * 24L * 60L * 60L * 1000L;
+            boolean recentSameNetworkOwner = networkLastSeen > 0L && loginAt >= networkLastSeen && loginAt - networkLastSeen <= 14L * 24L * 60L * 60L * 1000L;
+            int householdAccounts = sameIp ? database.accountsSeenOnIpBefore(ipHash, rootSanction.createdAt, rootUuid) : 0;
+            boolean sharedHousehold = householdAccounts >= 1;
+            int burstAccounts = sameIp ? database.recentDifferentAccountCount(ipHash, rootSanction.createdAt, loginAt, altUuid) : 0;
+            boolean localTest = isLocalStandaloneTest(addressScope, forwarded);
+            boolean proxyLoopback = "LOOPBACK".equals(addressScope) && !localTest;
+            boolean usableSameIp = sameIp && !proxyLoopback;
+
+            List<String> tags = new ArrayList<>();
+            int score = 0;
+            if (priorLink) { score += 100; tags.add("proven-link"); }
+            if (sameClientToken) { score += 95; tags.add("client-cookie"); }
+            if (usableSameIp) { score += 38; tags.add("exact-ip"); }
+            if (sameNetwork && !proxyLoopback) { score += 12; tags.add("network-prefix"); }
+            if (distinctiveFingerprint) { score += 18; tags.add("client-profile"); }
+            else if (sameFingerprint) { score += 3; tags.add("common-client-profile"); }
+            if (commonIps >= 2) { score += 12; tags.add("multi-ip-history"); }
+            if (commonNetworks >= 2) { score += 8; tags.add("multi-network-history"); }
+            if (freshAccount) { score += 10; tags.add("new-account"); }
+            if (veryRapid) { score += 20; tags.add("rapid-reconnect"); }
+            else if (rapid) { score += 10; tags.add("recent-sanction"); }
+            if (recentSameIpOwner) { score += 10; tags.add("recent-ip-use"); }
+            if (recentSameNetworkOwner && !sameIp) { score += 5; tags.add("recent-network-use"); }
+            if (burstAccounts > 0) { score += Math.min(15, 5 + burstAccounts * 5); tags.add("account-burst"); }
+            if (sharedHousehold && !sameClientToken && !priorLink) { score -= 30; tags.add("shared-network-safety"); }
+            if (historicalConcurrency && !sameClientToken && !priorLink) { score -= 25; tags.add("historical-concurrency-safety"); }
+            if (existedBeforeSanction && !sameClientToken && !priorLink) { score -= 15; tags.add("preexisting-account"); }
+
+            boolean localLoopbackProof = localTest && sameIp;
+            if (localLoopbackProof) {
+                score = 100;
+                tags.add("offline-local-test");
+            }
+            score = Math.max(0, Math.min(100, score));
+
+            boolean conclusive = priorLink || sameClientToken;
+            boolean freshRapidExact = usableSameIp && freshAccount && veryRapid && recentSameIpOwner && !sharedHousehold && !historicalConcurrency;
+            boolean exactDevicePattern = usableSameIp && distinctiveFingerprint && rapid && recentSameIpOwner && !historicalConcurrency && (!sharedHousehold || burstAccounts > 0);
+            boolean historicalDevicePattern = usableSameIp && distinctiveFingerprint && commonIps >= 2 && recentSameIpOwner && !sharedHousehold && !historicalConcurrency;
+            boolean nearbyNetworkDevicePattern = sameNetwork && distinctiveFingerprint && freshAccount && veryRapid && recentSameNetworkOwner && !sharedHousehold && !historicalConcurrency && !proxyLoopback;
+            boolean aggressiveExact = settings.altMode.equals("AGGRESSIVE") && freshRapidExact;
+
+            boolean evidence;
+            int threshold;
+            switch (settings.altMode) {
+                case "SAFE" -> {
+                    evidence = conclusive || localLoopbackProof;
+                    threshold = 95;
+                }
+                case "AGGRESSIVE" -> {
+                    evidence = conclusive || localLoopbackProof || exactDevicePattern || historicalDevicePattern || nearbyNetworkDevicePattern || aggressiveExact;
+                    threshold = 65;
+                }
+                default -> {
+                    evidence = conclusive || localLoopbackProof || exactDevicePattern || historicalDevicePattern || nearbyNetworkDevicePattern;
+                    threshold = 80;
+                }
+            }
+
+            // In pre-login we intentionally use only network/history evidence that is already
+            // available before a Player object exists. Client cookies/profile signals are added
+            // immediately after join and can still remove the player within the first moments.
+            if (preLogin && !localLoopbackProof && !priorLink && !aggressiveExact) evidence = false;
+            boolean act = evidence && score >= threshold;
+            String evidenceText = tags.isEmpty() ? "none" : String.join(",", tags);
+
+            AltDecision d = new AltDecision(rootSanction, rootUuid, rootName, score, act, evidenceText);
+            if (best == null || d.score > best.score || (rootSanction.type.equals("BLACKLIST") && !best.mainSanction.type.equals("BLACKLIST"))) best = d;
+        }
+        return best;
+    }
+
+    private boolean isLocalStandaloneTest(String addressScope, boolean forwarded) {
+        return serverOfflineMode && !proxyForwardingConfigured && !forwarded && "LOOPBACK".equals(addressScope);
+    }
+
+    private void logAltDecision(String altName, AltDecision decision, boolean acted) {
+        if (decision == null) return;
+        getLogger().info("Alt check: " + altName + " -> " + decision.mainName + " | score=" + decision.score + "% | " + (acted ? "ACTION" : "REVIEW") + " | " + decision.evidence);
+    }
+
+    private void maybeFlagAltSuspicion(UUID altUuid, String altName, AltDecision decision) throws SQLException {
+        if (database.recordSuspicionOnce(decision.mainUuid, altUuid, decision.score, 24L * 60L * 60L * 1000L)) {
+            database.insertEvent("ALT_SUSPECT", altName + " -> " + decision.mainName + "|REVIEW ONLY - no automatic punishment|confidence " + decision.score + "%|" + decision.evidence);
+        }
+    }
+
+    private Punishment applyAltDecision(UUID altUuid, String altName, AltDecision decision) throws SQLException {
+        long now = System.currentTimeMillis();
+        Punishment already = database.findStrongestActive(altUuid, altName, Set.of("BLACKLIST", "BAN"), now);
+        if (already != null) return already;
+
+        if (decision.mainSanction.type.equals("BLACKLIST")) {
+            Punishment p = systemPunishment("BLACKLIST", altUuid, altName, "Alt account of someone who has been blacklisted.", 0L, decision.mainSanction.id);
+            database.insertPunishment(p);
+            database.recordEvasion(decision.mainUuid, altUuid, "BLACKLIST", decision.score);
+            database.insertEvent("ALT_ACTION", altName + " -> " + decision.mainName + "|BLACKLISTED|confidence " + decision.score + "%|" + decision.evidence);
+            return p;
+        }
+
+        int prior = database.countBanEvasionAlts(decision.mainUuid);
+        if (prior <= 0) {
+            long expiry = decision.mainSanction.expiresAt;
+            Punishment p = systemPunishment("BAN", altUuid, altName, "System flagged this account for ban evasion. If it happens again, you will be permanently blacklisted.", expiry, decision.mainSanction.id);
+            database.insertPunishment(p);
+            database.recordEvasion(decision.mainUuid, altUuid, "BAN", decision.score);
+            database.insertEvent("ALT_ACTION", altName + " -> " + decision.mainName + "|BAN EVASION - inherited ban|confidence " + decision.score + "%|" + decision.evidence);
+            return p;
+        }
+
+        Punishment altBlacklist = systemPunishment("BLACKLIST", altUuid, altName, "Repeated ban evasion.", 0L, decision.mainSanction.id);
+        database.insertPunishment(altBlacklist);
+        Punishment mainBlacklist = systemPunishment("BLACKLIST", decision.mainUuid, decision.mainName, "Repeated ban evasion.", 0L, decision.mainSanction.id);
+        if (database.findStrongestActive(decision.mainUuid, decision.mainName, Set.of("BLACKLIST"), now) == null) database.insertPunishment(mainBlacklist);
+        for (UUID priorAlt : database.getBanEvasionAlts(decision.mainUuid)) {
+            if (database.findStrongestActive(priorAlt, database.latestName(priorAlt), Set.of("BLACKLIST"), now) == null) {
+                database.insertPunishment(systemPunishment("BLACKLIST", priorAlt, database.latestName(priorAlt), "Repeated ban evasion linked to this account.", 0L, decision.mainSanction.id));
+            }
+        }
+        database.recordEvasion(decision.mainUuid, altUuid, "BAN", decision.score);
+        database.insertEvent("ALT_ACTION", altName + " -> " + decision.mainName + "|PERMANENT BLACKLIST - repeated ban evasion|confidence " + decision.score + "%|" + decision.evidence);
+        return altBlacklist;
+    }
+
+    private Punishment systemPunishment(String type, UUID uuid, String name, String reason, long expiresAt, String parentId) {
+        long now = System.currentTimeMillis();
+        return new Punishment(UUID.randomUUID().toString(), type, uuid, name, null, "SYSTEM", "§c[SYSTEM]", reason, now, expiresAt, true, parentId);
+    }
+
+    private void openMain(Player player) {
+        Inventory inv = Bukkit.createInventory(null, 54, UI_MAIN);
+        fill(inv, Material.BLACK_STAINED_GLASS_PANE, " ");
+        set(inv, 4, item(Material.NETHER_STAR, "§6§lWorldsGreatestModeration", "§7Network moderation control center", "§8Fast • global • audited"));
+        set(inv, 10, actionItem(Material.IRON_BARS, "§c§lBan", "BAN", "§7Temporarily or permanently ban an account."));
+        set(inv, 12, actionItem(Material.BOOK, "§6§lWarn", "WARN", "§7Issue a timed or permanent warning."));
+        set(inv, 14, actionItem(Material.FEATHER, "§e§lKick", "KICK", "§7Disconnect a player from the network."));
+        set(inv, 16, actionItem(Material.REDSTONE_TORCH, "§d§lMute", "MUTE", "§7Block chat and common message commands."));
+        set(inv, 20, actionItem(Material.TNT, "§4§lBlacklist", "BLACKLIST", "§7Timed or permanent network exclusion.", "§cUse only for severe cases."));
+        set(inv, 22, actionItem(Material.LIME_STAINED_GLASS_PANE, "§a§lRemove Punishment", "UNBAN", "§7Unban, unmute, or unblacklist."));
+        set(inv, 24, actionItem(Material.BOOKSHELF, "§b§lHistory", "HISTORY", "§7View complete moderation history."));
+        set(inv, 30, actionItem(Material.YELLOW_CONCRETE, "§e§lWarnings", "WARNINGS", "§7View active warnings for a player."));
+        set(inv, 32, actionItem(Material.PLAYER_HEAD, "§f§lPlayer Lookup", "HISTORY", "§7Choose an online player or enter a name."));
+        if (player.isOp()) set(inv, 40, item(Material.COMPARATOR, "§c§lConfiguration", "§7OP-only network configuration."));
+        set(inv, 49, item(Material.BARRIER, "§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("MAIN", null, null, 0L, 0, null));
+        player.openInventory(inv);
