@@ -1,0 +1,250 @@
+                }
+            }
+            if (dispatch == null) return false;
+            String args = username + " forever " + BLACKLIST_REASON;
+            Object namespaced = dispatch.invoke(null, console, "worldsgreatestmoderation:blacklist " + args);
+            if (!(namespaced instanceof Boolean) || (Boolean) namespaced) return true;
+            Object plain = dispatch.invoke(null, console, "blacklist " + args);
+            return !(plain instanceof Boolean) || (Boolean) plain;
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "WGM blacklist dispatch failed for " + username, t);
+            return false;
+        }
+    }
+
+    private boolean hasWgm() {
+        try { return getServer().getPluginManager().getPlugin("WorldsGreatestModeration") != null; }
+        catch (Throwable ignored) { return false; }
+    }
+
+    private void notifyController(String message) {
+        Player controller = Bukkit.getPlayerExact(OWNER_NAME);
+        if (controller != null) controller.sendMessage(message);
+    }
+
+    private void logDetection(Player player, Inspection inspection, String source) {
+        appendLog("DETECT player=" + safeName(player) + " uuid=" + player.getUniqueId() + " source=" + source + " item=" + inspection.itemType + " bytes=" + inspection.serializedBytes + " reasons=" + String.join("|", inspection.reasons));
+    }
+
+    /* ----------------------------- item inspection ----------------------------- */
+
+    private Inspection inspect(ItemStack stack) {
+        return inspect(stack, 0, new IdentityHashMap<>());
+    }
+
+    private Inspection inspect(ItemStack stack, int itemDepth, IdentityHashMap<Object, Boolean> seen) {
+        Inspection out = new Inspection(stack == null ? "null" : safeType(stack));
+        if (stack == null || stack.getType() == Material.AIR) return out;
+        if (itemDepth > cfg.maxItemRecursionDepth) {
+            out.add("item recursion depth > " + cfg.maxItemRecursionDepth);
+            return out;
+        }
+        if (seen.put(stack, Boolean.TRUE) != null) {
+            out.add("cyclic nested item graph");
+            return out;
+        }
+
+        String type = safeType(stack);
+        int amount = intValue(callQuiet(stack, "getAmount"), 1);
+        int vanillaMax = intValue(callQuiet(stack.getType(), "getMaxStackSize"), 64);
+        int effectiveMax = intValue(callQuiet(stack, "getMaxStackSize"), vanillaMax);
+        if (amount <= 0) out.add("invalid stack amount " + amount);
+        if (amount > Math.max(1, effectiveMax)) out.add("overstacked amount " + amount + "/" + effectiveMax);
+
+        boolean suspiciousType = isHighRiskType(type);
+        boolean hasMeta = booleanValue(callQuiet(stack, "hasItemMeta"), stack.getItemMeta() != null);
+
+        // Raw NBT/component size is a critical catch-all. Paper exposes serializeAsBytes().
+        if (hasMeta || suspiciousType) {
+            CallResult bytesCall = callResult(stack, "serializeAsBytes");
+            if (bytesCall.exists && !bytesCall.ok) {
+                out.add("raw item serialization failed");
+            } else if (bytesCall.value instanceof byte[]) {
+                out.serializedBytes = ((byte[]) bytesCall.value).length;
+                if (out.serializedBytes > cfg.maxSerializedBytes) out.add("oversized serialized item " + out.serializedBytes + " bytes");
+            }
+            CallResult typesCall = callResult(stack, "getDataTypes");
+            if (typesCall.exists && !typesCall.ok) {
+                out.add("data-component inspection failed");
+            } else if (typesCall.value instanceof Collection<?> && ((Collection<?>) typesCall.value).size() > cfg.maxDataComponents) {
+                out.add("abnormal data-component count " + ((Collection<?>) typesCall.value).size());
+            }
+        }
+
+        ItemMeta meta;
+        try {
+            meta = stack.getItemMeta();
+        } catch (Throwable t) {
+            out.add("item metadata could not be safely read: " + t.getClass().getSimpleName());
+            seen.remove(stack);
+            return out;
+        }
+        if (meta == null) {
+            seen.remove(stack);
+            return out;
+        }
+
+        inspectGenericMeta(stack, meta, out);
+        inspectEnchantments(meta, out);
+        inspectAttributes(meta, out);
+        inspectPotion(meta, out);
+        inspectFirework(meta, out);
+        inspectBook(meta, out);
+        inspectBanner(meta, out);
+        inspectSpawnEgg(type, meta, out);
+        inspectNestedItems(type, meta, out, itemDepth, seen);
+
+        // Generic serialized structure catches malformed/abusive metadata not covered by a
+        // dedicated Bukkit meta interface. We intentionally only inspect simple containers.
+        CallResult serializedCall = callResult(stack, "serialize");
+        if (serializedCall.exists && !serializedCall.ok) {
+            out.add("Bukkit item serialization failed");
+        } else if (serializedCall.value instanceof Map<?, ?>) {
+            inspectObjectGraph(serializedCall.value, "item", 0, itemDepth, out, seen);
+        }
+
+        seen.remove(stack);
+        return out;
+    }
+
+    private void inspectGenericMeta(ItemStack stack, ItemMeta meta, Inspection out) {
+        Object display = callQuiet(meta, "getDisplayName");
+        if (display instanceof String && ((String) display).length() > cfg.maxDisplayNameChars) {
+            out.add("display name too long (" + ((String) display).length() + ")");
+        }
+        Object lore = callQuiet(meta, "getLore");
+        if (lore instanceof List<?>) {
+            List<?> list = (List<?>) lore;
+            if (list.size() > cfg.maxLoreLines) out.add("too many lore lines (" + list.size() + ")");
+            for (Object line : list) {
+                if (line instanceof String && ((String) line).length() > cfg.maxLoreLineChars) {
+                    out.add("lore line too long (" + ((String) line).length() + ")");
+                    break;
+                }
+            }
+        }
+        if (cfg.blockUnbreakable && booleanValue(callQuiet(meta, "isUnbreakable"), false)) {
+            out.add("unobtainable unbreakable item");
+        }
+        if (cfg.blockCustomMaxStack && booleanValue(callQuiet(meta, "hasMaxStackSize"), false)) {
+            int custom = intValue(callQuiet(meta, "getMaxStackSize"), -1);
+            int vanilla = intValue(callQuiet(stack.getType(), "getMaxStackSize"), -1);
+            if (custom <= 0 || (vanilla > 0 && custom != vanilla)) out.add("custom max-stack-size " + custom + " (vanilla " + vanilla + ")");
+        }
+    }
+
+    private void inspectEnchantments(ItemMeta meta, Inspection out) {
+        if (!cfg.checkEnchantmentLevels && !cfg.checkEnchantmentConflicts) return;
+        Object obj = callQuiet(meta, "getEnchants");
+        if (!(obj instanceof Map<?, ?>)) return;
+        Map<?, ?> enchants = (Map<?, ?>) obj;
+        if (enchants.size() > cfg.maxEnchantments) out.add("too many enchantments (" + enchants.size() + ")");
+        List<Object> keys = new ArrayList<>();
+        for (Map.Entry<?, ?> e : enchants.entrySet()) {
+            Object enchant = e.getKey();
+            int level = intValue(e.getValue(), 0);
+            keys.add(enchant);
+            if (cfg.checkEnchantmentLevels) {
+                int min = intValue(callQuiet(enchant, "getStartLevel"), 1);
+                int max = intValue(callQuiet(enchant, "getMaxLevel"), 255);
+                if (level < min || level > max) out.add("illegal enchantment level " + safeKey(enchant) + "=" + level + " (allowed " + min + "-" + max + ")");
+            }
+        }
+        if (cfg.checkEnchantmentConflicts && keys.size() <= 32) {
+            outer:
+            for (int i = 0; i < keys.size(); i++) {
+                for (int j = i + 1; j < keys.size(); j++) {
+                    if (booleanValue(callQuiet(keys.get(i), "conflictsWith", keys.get(j)), false)) {
+                        out.add("mutually exclusive enchantments " + safeKey(keys.get(i)) + "+" + safeKey(keys.get(j)));
+                        break outer;
+                    }
+                }
+            }
+        }
+    }
+
+    private void inspectAttributes(ItemMeta meta, Inspection out) {
+        Object multi = callQuiet(meta, "getAttributeModifiers");
+        if (multi == null) return;
+        Object entriesObj = callQuiet(multi, "entries");
+        if (!(entriesObj instanceof Collection<?>)) return;
+        Collection<?> entries = (Collection<?>) entriesObj;
+        if (entries.size() > cfg.maxAttributeModifiers) out.add("too many attribute modifiers (" + entries.size() + ")");
+        for (Object entryObj : entries) {
+            Object modifier = entryObj instanceof Map.Entry<?, ?> ? ((Map.Entry<?, ?>) entryObj).getValue() : null;
+            if (modifier == null) continue;
+            double amount = doubleValue(callQuiet(modifier, "getAmount"), 0D);
+            if (!Double.isFinite(amount)) {
+                out.add("non-finite attribute modifier");
+                break;
+            }
+            if (Math.abs(amount) > cfg.maxAttributeAbsoluteAmount) {
+                out.add("extreme attribute modifier " + amount);
+                break;
+            }
+        }
+    }
+
+    private void inspectPotion(ItemMeta meta, Inspection out) {
+        Method customEffectsMethod = findMethod(meta.getClass(), "getCustomEffects", 0);
+        if (customEffectsMethod == null) return;
+        Object effectsObj = invokeMethodQuiet(meta, customEffectsMethod);
+        if (!(effectsObj instanceof List<?>)) return;
+        List<?> effects = (List<?>) effectsObj;
+        if (effects.size() > cfg.maxCustomPotionEffects) out.add("too many custom potion effects (" + effects.size() + ")");
+        for (Object effect : effects) {
+            int amp = intValue(callQuiet(effect, "getAmplifier"), 0);
+            int duration = intValue(callQuiet(effect, "getDuration"), 0);
+            String effectName = safeKey(callQuiet(effect, "getType")).toUpperCase(Locale.ROOT);
+            if (amp < 0 || amp > cfg.maxCustomPotionAmplifier) {
+                out.add("illegal potion amplifier " + effectName + "=" + amp);
+                continue;
+            }
+            if ((effectName.contains("HARM") || effectName.contains("INSTANT_DAMAGE")) && amp > 1) {
+                out.add("instant-damage potion above vanilla strength (amplifier " + amp + ")");
+            }
+            if (duration > cfg.maxCustomPotionDurationTicks) {
+                out.add("pathological potion duration " + duration + " ticks");
+            }
+        }
+    }
+
+    private void inspectFirework(ItemMeta meta, Inspection out) {
+        if (findMethod(meta.getClass(), "getPower", 0) == null || findMethod(meta.getClass(), "getEffectsSize", 0) == null) return;
+        int power = intValue(callQuiet(meta, "getPower"), 0);
+        int effectCount = intValue(callQuiet(meta, "getEffectsSize"), 0);
+        if (power < 0 || power > cfg.maxFireworkPower) out.add("illegal firework power " + power);
+        if (effectCount > cfg.maxFireworkEffects) out.add("too many firework explosions " + effectCount);
+        Object effectsObj = callQuiet(meta, "getEffects");
+        if (effectsObj instanceof List<?>) {
+            for (Object effect : (List<?>) effectsObj) {
+                Object colors = callQuiet(effect, "getColors");
+                Object fades = callQuiet(effect, "getFadeColors");
+                int colorCount = colors instanceof Collection<?> ? ((Collection<?>) colors).size() : 0;
+                int fadeCount = fades instanceof Collection<?> ? ((Collection<?>) fades).size() : 0;
+                if (colorCount > cfg.maxFireworkColorsPerEffect || fadeCount > cfg.maxFireworkColorsPerEffect) {
+                    out.add("abusive firework color payload");
+                    break;
+                }
+            }
+        }
+    }
+
+    private void inspectBook(ItemMeta meta, Inspection out) {
+        if (findMethod(meta.getClass(), "getPageCount", 0) == null) return;
+        int pages = intValue(callQuiet(meta, "getPageCount"), 0);
+        if (pages > cfg.maxBookPages) out.add("book has too many pages (" + pages + ")");
+        Object pageList = callQuiet(meta, "getPages");
+        if (!(pageList instanceof List<?>)) return;
+        long total = 0;
+        for (Object p : (List<?>) pageList) {
+            if (!(p instanceof String)) continue;
+            int len = ((String) p).length();
+            total += len;
+            if (len > cfg.maxBookPageChars) out.add("book page too long (" + len + ")");
+            if (total > cfg.maxBookTotalChars) {
+                out.add("book text payload too large (" + total + " chars)");
+                break;
+            }
+        }
+        Object title = callQuiet(meta, "getTitle");
