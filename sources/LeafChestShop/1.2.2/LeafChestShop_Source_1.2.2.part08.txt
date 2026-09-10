@@ -1,0 +1,36 @@
+commands:
+  leafchestshop:
+    aliases: [lcs]
+    description: Chest shop commands
+    usage: /lcs help
+  rate:
+    description: Rate a chest shop seller from 1 to 5
+    usage: /rate <seller> <1-5>
+  rating:
+    description: View a chest shop seller rating
+    usage: /rating <seller>
+  viewadminchestshops:
+    description: Browse all chest shops created by admins
+    usage: /viewadminchestshops
+  adminchestshop:
+    description: Receive an unlimited-stock admin chest shop item
+    usage: /adminchestshop
+  chestshop:
+    description: Admin chest shop ownership tools
+    usage: /chestshop create <username>
+permissions:
+  leafchestshop.use:
+    description: Use chest shops
+    default: true
+  leafchestshop.create:
+    description: Create and edit player chest shops
+    default: true
+  leafchestshop.rate:
+    description: Rate chest shop sellers
+    default: true
+  leafchestshop.admin:
+    description: Create admin shops and administer the plugin
+    default: op
+  leafchestshop.bypass:
+    description: Bypass shop protection
+    default: op
