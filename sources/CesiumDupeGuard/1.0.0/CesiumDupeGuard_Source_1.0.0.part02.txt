@@ -1,0 +1,179 @@
+        settingsYaml.set("enforce-paper-safe-settings", settings.enforcePaperSafeSettings);
+        settingsYaml.set("backstops.falling-block-end-portal", settings.fallingBlockPortalBackstop);
+        settingsYaml.set("backstops.piston-dupe-materials-if-native-unsafe", settings.pistonBackstop);
+        settingsYaml.set("backstops.tripwire-if-native-unsafe", settings.tripwireBackstop);
+        settingsYaml.set("operator-alerts", settings.opAlerts);
+        settingsYaml.set("audit-interval-ticks", settings.auditIntervalTicks);
+        try { settingsYaml.save(settingsFile); }
+        catch (IOException e) { getLogger().log(Level.WARNING, "Could not save DupeGuard settings", e); }
+    }
+
+    private synchronized void auditPaperSettings() {
+        Path path = paperGlobalPath();
+        if (path == null || !Files.isRegularFile(path)) {
+            paperState = PaperState.unknown();
+            return;
+        }
+        try {
+            String text = Files.readString(path, StandardCharsets.UTF_8);
+            PaperState previous = paperState;
+            PaperState next = new PaperState(
+                    true,
+                    boolState(text, "allow-piston-duplication", false),
+                    boolState(text, "allow-unsafe-end-portal-teleportation", false),
+                    boolState(text, "skip-tripwire-hook-placement-validation", false),
+                    boolState(text, "allow-headless-pistons", false),
+                    boolState(text, "allow-permanent-block-break-exploits", false),
+                    previous != null && previous.restartRecommended
+            );
+            paperState = next;
+            if (!next.allSafe() && settings.enforcePaperSafeSettings) {
+                applySafePaperSettings(false);
+            }
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "Could not read Paper global configuration", t);
+            paperState = PaperState.unknown();
+        }
+    }
+
+    private synchronized PaperEditResult applySafePaperSettings(boolean manual) {
+        hardenRuns.incrementAndGet();
+        Path path = paperGlobalPath();
+        if (path == null || !Files.isRegularFile(path)) {
+            paperState = PaperState.unknown();
+            return new PaperEditResult(false, "§cCould not locate config/paper-global.yml.");
+        }
+        try {
+            String original = Files.readString(path, StandardCharsets.UTF_8);
+            String changed = original;
+            changed = forceBooleanFalse(changed, "allow-piston-duplication");
+            changed = forceBooleanFalse(changed, "allow-unsafe-end-portal-teleportation");
+            changed = forceBooleanFalse(changed, "skip-tripwire-hook-placement-validation");
+            changed = forceBooleanFalse(changed, "allow-headless-pistons");
+            changed = forceBooleanFalse(changed, "allow-permanent-block-break-exploits");
+
+            boolean didChange = !original.equals(changed);
+            if (didChange) {
+                Path backup = path.resolveSibling("paper-global.yml.cesium-dupeguard-backup-" + Instant.now().toEpochMilli());
+                Files.copy(path, backup, StandardCopyOption.COPY_ATTRIBUTES);
+                Path temp = path.resolveSibling("paper-global.yml.cesium-dupeguard.tmp");
+                Files.writeString(temp, changed, StandardCharsets.UTF_8);
+                try {
+                    Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (IOException atomicUnsupported) {
+                    Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
+                }
+                getLogger().warning("Hardened Paper/Leaf unsupported exploit settings. Full restart required. Backup: " + backup.getFileName());
+                notifyOps("§ePaper/Leaf dupe-related settings were hardened. §cA full restart is required.");
+            }
+
+            String current = Files.readString(path, StandardCharsets.UTF_8);
+            paperState = new PaperState(
+                    true,
+                    boolState(current, "allow-piston-duplication", false),
+                    boolState(current, "allow-unsafe-end-portal-teleportation", false),
+                    boolState(current, "skip-tripwire-hook-placement-validation", false),
+                    boolState(current, "allow-headless-pistons", false),
+                    boolState(current, "allow-permanent-block-break-exploits", false),
+                    didChange || (paperState != null && paperState.restartRecommended)
+            );
+            return new PaperEditResult(didChange, didChange ? "§aSafe Paper values written. §eRestart the server to apply them." : "§aPaper/Leaf's documented duplication switches are already safe.");
+        } catch (Throwable t) {
+            getLogger().log(Level.SEVERE, "Failed to harden Paper global configuration", t);
+            return new PaperEditResult(false, "§cCould not update Paper configuration. Check console.");
+        }
+    }
+
+    private Path paperGlobalPath() {
+        Path cwd = Path.of(System.getProperty("user.dir", "."));
+        List<Path> candidates = List.of(
+                cwd.resolve("config").resolve("paper-global.yml"),
+                cwd.resolve("paper-global.yml")
+        );
+        for (Path p : candidates) if (Files.isRegularFile(p)) return p;
+        return candidates.get(0);
+    }
+
+    private String forceBooleanFalse(String text, String key) {
+        Pattern p = Pattern.compile("(?m)^(\\s*" + Pattern.quote(key) + "\\s*:\\s*)(true|false)(\\s*(?:#.*)?)$");
+        Matcher m = p.matcher(text);
+        StringBuffer out = new StringBuffer();
+        while (m.find()) {
+            m.appendReplacement(out, Matcher.quoteReplacement(m.group(1) + "false" + m.group(3)));
+        }
+        m.appendTail(out);
+        return out.toString();
+    }
+
+    private TriState boolState(String text, String key, boolean safeValue) {
+        Pattern p = Pattern.compile("(?m)^\\s*" + Pattern.quote(key) + "\\s*:\\s*(true|false)\\s*(?:#.*)?$");
+        Matcher m = p.matcher(text);
+        if (!m.find()) return TriState.ABSENT;
+        boolean value = Boolean.parseBoolean(m.group(1));
+        return value == safeValue ? TriState.SAFE : TriState.UNSAFE;
+    }
+
+    private boolean isPaperPistonDupeMaterial(String name) {
+        if (name == null) return false;
+        if (name.equals("TNT")) return true;
+        if (name.equals("RAIL") || name.endsWith("_RAIL")) return true;
+        return name.endsWith("_CARPET");
+    }
+
+    private boolean isFallingBlock(Object entity) {
+        Class<?> c = entity.getClass();
+        while (c != null) {
+            if (c.getName().equals("org.bukkit.entity.FallingBlock")) return true;
+            for (Class<?> i : c.getInterfaces()) if (i.getName().equals("org.bukkit.entity.FallingBlock")) return true;
+            c = c.getSuperclass();
+        }
+        return false;
+    }
+
+    private String materialName(Object material) {
+        if (material == null) return "";
+        try {
+            Object name = material.getClass().getMethod("name").invoke(material);
+            return String.valueOf(name).toUpperCase(Locale.ROOT);
+        } catch (Throwable ignored) {
+            return String.valueOf(material).toUpperCase(Locale.ROOT);
+        }
+    }
+
+    private void blocked(String detail) {
+        getLogger().warning("Blocked dupe-prone mechanic: " + detail);
+        notifyOps("§cBlocked dupe-prone mechanic: §f" + detail);
+    }
+
+    private void notifyOps(String message) {
+        if (!settings.opAlerts) return;
+        long now = System.currentTimeMillis();
+        if (now - lastAlertMillis < 750L) return;
+        lastAlertMillis = now;
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (p.isOp()) p.sendMessage(PREFIX + message);
+        }
+    }
+
+    private Object callQuiet(Object target, String method, Object... args) {
+        if (target == null) return null;
+        try {
+            Method best = null;
+            outer:
+            for (Method m : target.getClass().getMethods()) {
+                if (!m.getName().equals(method) || m.getParameterCount() != args.length) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                for (int i = 0; i < pt.length; i++) {
+                    if (args[i] == null) continue;
+                    Class<?> expected = wrap(pt[i]);
+                    if (!expected.isAssignableFrom(args[i].getClass())) continue outer;
+                }
+                best = m;
+                break;
+            }
+            if (best == null) return null;
+            return best.invoke(target, args);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
