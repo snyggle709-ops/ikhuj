@@ -1,0 +1,250 @@
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onCraft(CraftItemEvent event) {
+        Player p = asPlayer(callQuiet(event, "getWhoClicked"));
+        if (p != null) scheduleScan(p, "craft", true, 1L);
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onPickup(EntityPickupItemEvent event) {
+        Player p = asPlayer(callQuiet(event, "getEntity"));
+        if (p == null) return;
+        Object itemEntity = callQuiet(event, "getItem");
+        ItemStack stack = asItem(callQuiet(itemEntity, "getItemStack"));
+        if (stack == null) return;
+        Inspection result = inspect(stack);
+        if (result.dangerous()) {
+            callQuiet(event, "setCancelled", true);
+            callQuiet(itemEntity, "remove");
+            enforce(p, result, "pickup");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onDrop(PlayerDropItemEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        Object itemEntity = callQuiet(event, "getItemDrop");
+        ItemStack stack = asItem(callQuiet(itemEntity, "getItemStack"));
+        if (p == null || stack == null) return;
+        Inspection result = inspect(stack);
+        if (result.dangerous()) {
+            callQuiet(itemEntity, "remove");
+            enforce(p, result, "drop");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onPlace(BlockPlaceEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        ItemStack stack = asItem(callQuiet(event, "getItemInHand"));
+        if (p == null || stack == null) return;
+        Inspection result = inspect(stack);
+        if (result.dangerous()) {
+            callQuiet(event, "setCancelled", true);
+            removeMatchingDangerousItems(p, "block-place");
+            enforce(p, result, "block-place");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onInteract(PlayerInteractEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        ItemStack stack = asItem(callQuiet(event, "getItem"));
+        if (p == null || stack == null) return;
+        Inspection result = inspect(stack);
+        if (result.dangerous()) {
+            callQuiet(event, "setCancelled", true);
+            removeMatchingDangerousItems(p, "interact");
+            enforce(p, result, "interact");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onConsume(PlayerItemConsumeEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        ItemStack stack = asItem(callQuiet(event, "getItem"));
+        if (p == null || stack == null) return;
+        Inspection result = inspect(stack);
+        if (result.dangerous()) {
+            callQuiet(event, "setCancelled", true);
+            removeMatchingDangerousItems(p, "consume");
+            enforce(p, result, "consume");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onSwap(PlayerSwapHandItemsEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        if (p == null) return;
+        ItemStack a = asItem(callQuiet(event, "getMainHandItem"));
+        ItemStack b = asItem(callQuiet(event, "getOffHandItem"));
+        Inspection hit = firstDanger(a, b);
+        if (hit != null) {
+            callQuiet(event, "setCancelled", true);
+            removeMatchingDangerousItems(p, "swap-hands");
+            enforce(p, hit, "swap-hands");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onHeld(PlayerItemHeldEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        if (p != null) scheduleScan(p, "held-slot", true, 1L);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onRespawn(PlayerRespawnEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        if (p != null) scheduleScan(p, "respawn", true, 1L);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onWorldChange(PlayerChangedWorldEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        if (p != null) scheduleScan(p, "world-change", true, 1L);
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onDeath(PlayerDeathEvent event) {
+        Player p = asPlayer(callQuiet(event, "getEntity"));
+        Object dropsObj = callQuiet(event, "getDrops");
+        if (p == null || !(dropsObj instanceof List<?>)) return;
+        Inspection first = null;
+        List<?> drops = (List<?>) dropsObj;
+        for (int i = drops.size() - 1; i >= 0; i--) {
+            Object o = drops.get(i);
+            if (!(o instanceof ItemStack)) continue;
+            Inspection result = inspect((ItemStack) o);
+            if (result.dangerous()) {
+                if (first == null) first = result;
+                try { drops.remove(i); } catch (Throwable ignored) { }
+            }
+        }
+        if (first != null) {
+            removeMatchingDangerousItems(p, "death");
+            enforce(p, first, "death-drops");
+        }
+    }
+
+    /* ----------------------------- scanner/enforcement ----------------------------- */
+
+    private void periodicScan() {
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            try {
+                scanPlayer(p, "periodic", false);
+            } catch (Throwable t) {
+                getLogger().log(Level.WARNING, "Periodic item scan failed for " + safeName(p), t);
+            }
+        }
+    }
+
+    private void scheduleScan(Player p, String source, boolean force, long delay) {
+        if (p == null) return;
+        getServer().getScheduler().runTask(this, () -> scanPlayer(p, source, force));
+    }
+
+    private boolean scanPlayer(Player player, String source, boolean force) {
+        if (player == null || enforcementInProgress.contains(player.getUniqueId())) return false;
+        Inventory inv = player.getInventory();
+        int size = inv.getSize();
+        SlotCache cache = scanCache.computeIfAbsent(player.getUniqueId(), id -> new SlotCache(size));
+        if (cache.hashes.length != size) cache = new SlotCache(size);
+        scanCache.put(player.getUniqueId(), cache);
+
+        Inspection first = null;
+        for (int slot = 0; slot < size; slot++) {
+            ItemStack stack = inv.getItem(slot);
+            int hash = stack == null ? 0 : stack.hashCode();
+            if (!force && cache.hashes[slot] == hash) continue;
+            cache.hashes[slot] = hash;
+            if (stack == null || stack.getType() == Material.AIR) continue;
+            Inspection result = inspect(stack);
+            if (result.dangerous()) {
+                inv.setItem(slot, null);
+                cache.hashes[slot] = 0;
+                if (first == null) first = result;
+                logDetection(player, result, source + ":slot=" + slot);
+            }
+        }
+
+        Object open = callQuiet(player, "getOpenInventory");
+        ItemStack cursor = asItem(callQuiet(open, "getCursor"));
+        if (cursor != null && cursor.getType() != Material.AIR) {
+            Inspection result = inspect(cursor);
+            if (result.dangerous()) {
+                callQuiet(open, "setCursor", (Object) null);
+                if (first == null) first = result;
+                logDetection(player, result, source + ":cursor");
+            }
+        }
+
+        if (first != null) {
+            callQuiet(player, "updateInventory");
+            enforce(player, first, source);
+            return true;
+        }
+        return false;
+    }
+
+    private void removeMatchingDangerousItems(Player player, String source) {
+        if (player == null) return;
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < inv.getSize(); i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack == null || stack.getType() == Material.AIR) continue;
+            Inspection result = inspect(stack);
+            if (result.dangerous()) {
+                inv.setItem(i, null);
+                logDetection(player, result, source + ":purge-slot=" + i);
+            }
+        }
+        Object open = callQuiet(player, "getOpenInventory");
+        ItemStack cursor = asItem(callQuiet(open, "getCursor"));
+        if (cursor != null && inspect(cursor).dangerous()) callQuiet(open, "setCursor", (Object) null);
+        callQuiet(player, "updateInventory");
+    }
+
+    private void sanitizeUnattributedContainer(Inventory inventory, String opener) {
+        if (!cfg.sanitizeOpenedContainers) return;
+        for (int i = 0; i < inventory.getSize(); i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (stack == null || stack.getType() == Material.AIR) continue;
+            Inspection result = inspect(stack);
+            if (!result.dangerous()) continue;
+            inventory.setItem(i, null);
+            sanitizedContainers.incrementAndGet();
+            appendLog("CONTAINER_SANITIZED opener=" + opener + " slot=" + i + " item=" + result.itemType + " reasons=" + String.join("|", result.reasons));
+            getLogger().warning("Removed prohibited item from opened container (opener=" + opener + ", slot=" + i + "): " + String.join("; ", result.reasons));
+            notifyController("§c[ItemGuard] §7Sanitized a dangerous container item opened by §f" + opener + "§7: §c" + result.itemType);
+        }
+    }
+
+    private void enforce(Player player, Inspection inspection, String source) {
+        if (player == null) return;
+        UUID uuid = player.getUniqueId();
+        if (!enforcementInProgress.add(uuid)) return;
+        detections.incrementAndGet();
+
+        String name = player.getName();
+        appendLog("ENFORCE player=" + name + " uuid=" + uuid + " source=" + source + " item=" + inspection.itemType + " bytes=" + inspection.serializedBytes + " reasons=" + String.join("|", inspection.reasons));
+        getLogger().severe("Item exploit detected from " + name + " (" + uuid + ") via " + source + ". Removed item and handing permanent blacklist to WorldsGreatestModeration. Reasons: " + String.join("; ", inspection.reasons));
+        notifyController("§4§l[ItemGuard] §c" + name + " §7triggered exploit-item detection. §fWGM §7is applying a permanent §c" + BLACKLIST_REASON + " §7blacklist. §8(" + inspection.itemType + ": " + shortReasons(inspection.reasons) + ")");
+
+        boolean dispatched = dispatchWgmBlacklist(name);
+        if (!dispatched) {
+            getLogger().severe("Could not dispatch the WGM blacklist for " + name + ". The exploit item was removed, but ItemGuard does not maintain its own blacklist.");
+            notifyController("§4§l[ItemGuard] §cWARNING: WGM blacklist dispatch failed for §f" + name + "§c. ItemGuard has no fallback blacklist by design.");
+        }
+
+        getServer().getScheduler().runTask(this, () -> enforcementInProgress.remove(uuid));
+    }
+
+    private boolean dispatchWgmBlacklist(String username) {
+        if (!hasWgm()) return false;
+        try {
+            Class<?> bukkit = Class.forName("org.bukkit.Bukkit");
+            Object console = bukkit.getMethod("getConsoleSender").invoke(null);
+            Method dispatch = null;
+            for (Method m : bukkit.getMethods()) {
+                if (m.getName().equals("dispatchCommand") && Modifier.isStatic(m.getModifiers()) && m.getParameterCount() == 2) {
+                    dispatch = m;
+                    break;
