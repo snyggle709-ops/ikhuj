@@ -1,0 +1,250 @@
+            }
+            if (!hasMoney(buyer, price)) {
+                msg(buyer, "§cYou need " + money(price) + ".");
+                return;
+            }
+
+            ItemStack[] buyerSnapshot = cloneContents(buyer.getInventory().getStorageContents());
+            ItemStack[] shopSnapshot = shop.admin ? null : cloneContents(container.getInventory().getStorageContents());
+
+            if (!withdraw(buyer, price)) {
+                msg(buyer, "§cPayment failed.");
+                return;
+            }
+            if (!shop.admin && !deposit(owner, price)) {
+                if (!deposit(buyer, price)) {
+                    getLogger().severe("Buyer refund failed after owner deposit failure. Player=" + buyer.getUniqueId() + ", amount=" + price);
+                }
+                msg(buyer, "§cPayment could not be delivered to the shop owner. The purchase was cancelled.");
+                return;
+            }
+
+            boolean stockRemoved = shop.admin || removeExact(container.getInventory(), shop.item, shop.amount);
+            if (!stockRemoved) {
+                if (!shop.admin) restoreContents(container.getInventory(), shopSnapshot);
+                restoreContents(buyer.getInventory(), buyerSnapshot);
+                reverseTransfer(owner, buyer, price, !shop.admin);
+                msg(buyer, "§cStock changed during the transaction. The purchase was rolled back.");
+                return;
+            }
+
+            if (!addExact(buyer.getInventory(), shop.item, shop.amount)) {
+                restoreContents(buyer.getInventory(), buyerSnapshot);
+                if (!shop.admin) restoreContents(container.getInventory(), shopSnapshot);
+                reverseTransfer(owner, buyer, price, !shop.admin);
+                msg(buyer, "§cInventory changed during the transaction. The purchase was rolled back.");
+                return;
+            }
+            msg(buyer, "§aBought §f" + shop.amount + "x " + displayItem(shop.item) + "§a for §f" + money(price) + "§a.");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void sell(Player seller, Shop shop) {
+        if (shop.item == null) {
+            msg(seller, "§eThis shop does not have an item set yet.");
+            return;
+        }
+        double price = shop.buy;
+        if (price <= 0.0D) {
+            msg(seller, "§cThis shop is not buying items.");
+            return;
+        }
+        ReentrantLock lock = shopLocks.computeIfAbsent(shop.signKey, k -> new ReentrantLock());
+        if (!lock.tryLock()) {
+            msg(seller, "§eThat shop is busy. Try again.");
+            return;
+        }
+        try {
+            Container container = getContainer(shop);
+            if (container == null && !shop.admin) {
+                msg(seller, "§cThe shop container is missing.");
+                return;
+            }
+            if (!resolveEconomy()) {
+                msg(seller, "§cNo compatible Vault economy provider is available.");
+                return;
+            }
+            if (countSimilar(seller.getInventory(), shop.item) < shop.amount) {
+                msg(seller, "§cYou do not have enough matching items.");
+                return;
+            }
+
+            if (!shop.admin && !canFit(container.getInventory(), shop.item, shop.amount)) {
+                msg(seller, "§cThe shop is full.");
+                return;
+            }
+
+            OfflinePlayer owner = shop.admin ? null : shopOwnerOffline(shop);
+            if (!shop.admin && isActualOwner(seller, shop)) {
+                msg(seller, "§eYou own this shop.");
+                return;
+            }
+            if (!shop.admin && !hasMoney(owner, price)) {
+                msg(seller, "§cThe shop owner cannot afford this purchase.");
+                return;
+            }
+
+            ItemStack[] sellerSnapshot = cloneContents(seller.getInventory().getStorageContents());
+            ItemStack[] shopSnapshot = shop.admin ? null : cloneContents(container.getInventory().getStorageContents());
+
+            if (!shop.admin && !withdraw(owner, price)) {
+                msg(seller, "§cThe shop owner payment failed.");
+                return;
+            }
+            if (!deposit(seller, price)) {
+                if (!shop.admin && !deposit(owner, price)) {
+                    getLogger().severe("Owner refund failed after seller deposit failure. Owner=" + shop.owner + ", amount=" + price);
+                }
+                msg(seller, "§cPayment failed. No items were taken.");
+                return;
+            }
+
+            if (!removeExact(seller.getInventory(), shop.item, shop.amount)) {
+                restoreContents(seller.getInventory(), sellerSnapshot);
+                if (!shop.admin) restoreContents(container.getInventory(), shopSnapshot);
+                reverseSaleTransfer(seller, owner, price, !shop.admin);
+                msg(seller, "§cYour inventory changed during the transaction. The sale was rolled back.");
+                return;
+            }
+
+            if (!shop.admin) {
+                if (!addExact(container.getInventory(), shop.item, shop.amount)) {
+                    restoreContents(seller.getInventory(), sellerSnapshot);
+                    restoreContents(container.getInventory(), shopSnapshot);
+                    reverseSaleTransfer(seller, owner, price, true);
+                    msg(seller, "§cShop storage changed during the transaction. The sale was rolled back.");
+                    return;
+                }
+            }
+            msg(seller, "§aSold §f" + shop.amount + "x " + displayItem(shop.item) + "§a for §f" + money(price) + "§a.");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean resolveEconomy() {
+        if (economy != null) return true;
+        try {
+            Class<?> cls = Class.forName("net.milkbowl.vault.economy.Economy");
+            Object services = getServer().getClass().getMethod("getServicesManager").invoke(getServer());
+            Method registrationMethod = services.getClass().getMethod("getRegistration", Class.class);
+            Object registration = registrationMethod.invoke(services, cls);
+            if (registration == null) return false;
+            Object provider = registration.getClass().getMethod("getProvider").invoke(registration);
+            if (provider == null) return false;
+            economyClass = cls;
+            economy = provider;
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private boolean hasMoney(OfflinePlayer player, double amount) {
+        if (player == null) return false;
+        try {
+            Method m = economyClass.getMethod("has", OfflinePlayer.class, double.class);
+            return Boolean.TRUE.equals(m.invoke(economy, player, amount));
+        } catch (Throwable t) {
+            try {
+                return balance(player) >= amount;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+    }
+
+    private double balance(OfflinePlayer player) throws Exception {
+        Method m = economyClass.getMethod("getBalance", OfflinePlayer.class);
+        return ((Number) m.invoke(economy, player)).doubleValue();
+    }
+
+    private boolean withdraw(OfflinePlayer player, double amount) {
+        if (player == null || amount <= 0.0D) return false;
+        try {
+            Method m = economyClass.getMethod("withdrawPlayer", OfflinePlayer.class, double.class);
+            Object response = m.invoke(economy, player, amount);
+            return response != null && Boolean.TRUE.equals(response.getClass().getMethod("transactionSuccess").invoke(response));
+        } catch (Throwable t) {
+            getLogger().warning("Economy withdraw failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            return false;
+        }
+    }
+
+    private boolean deposit(OfflinePlayer player, double amount) {
+        if (player == null || amount <= 0.0D) return false;
+        try {
+            Method m = economyClass.getMethod("depositPlayer", OfflinePlayer.class, double.class);
+            Object response = m.invoke(economy, player, amount);
+            return response != null && Boolean.TRUE.equals(response.getClass().getMethod("transactionSuccess").invoke(response));
+        } catch (Throwable t) {
+            getLogger().warning("Economy deposit failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            return false;
+        }
+    }
+
+    private String economyName() {
+        if (!resolveEconomy()) return "not found";
+        try {
+            Object name = economyClass.getMethod("getName").invoke(economy);
+            return String.valueOf(name);
+        } catch (Throwable t) {
+            return economy.getClass().getSimpleName();
+        }
+    }
+
+    private String money(double amount) {
+        if (resolveEconomy()) {
+            try {
+                Object formatted = economyClass.getMethod("format", double.class).invoke(economy, amount);
+                if (formatted != null) return formatted.toString();
+            } catch (Throwable ignored) {
+            }
+        }
+        return new DecimalFormat("#,##0.##").format(amount);
+    }
+
+    private Container getContainer(Shop shop) {
+        Location loc = parseLocation(shop.containerKey);
+        if (loc == null) return null;
+        Block block = loc.getBlock();
+        BlockState state = block.getState();
+        return state instanceof Container c && isAllowedShopContainer(block) ? c : null;
+    }
+
+    private Block attachedContainer(Block sign) {
+        BlockData data = sign.getBlockData();
+        if (!(data instanceof Directional directional)) return null;
+        Block behind = sign.getRelative(directional.getFacing().getOppositeFace());
+        return behind.getState() instanceof Container && isAllowedShopContainer(behind) ? behind : null;
+    }
+
+    private static boolean isAllowedShopContainer(Block block) {
+        Material type = block.getType();
+        return type == Material.CHEST || type == Material.TRAPPED_CHEST || type == Material.BARREL;
+    }
+
+    private ItemStack specialChestItem(boolean admin, String ownerName, Player creator) {
+        ItemStack item = new ItemStack(Material.CHEST, 1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) return item;
+        List<String> lore = new ArrayList<>();
+        if (admin) {
+            meta.setDisplayName("§cAdmin Chest Shop");
+            lore.add("§7Place this chest and attach a shop sign.");
+            lore.add("§7The resulting shop has unlimited stock.");
+            lore.add(SPECIAL_MARKER + "A|" + creator.getUniqueId() + "|" + creator.getName());
+        } else {
+            meta.setDisplayName("§eChest Shop for " + ownerName);
+            lore.add("§7Place this chest and attach a shop sign.");
+            lore.add("§7The resulting shop belongs to §f" + ownerName + "§7.");
+            lore.add(SPECIAL_MARKER + "O|" + ownerName + "|" + creator.getUniqueId() + "|" + creator.getName());
+        }
+        meta.setLore(lore);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private SpecialChestData readSpecialChest(ItemStack item) {
