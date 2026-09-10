@@ -1,0 +1,250 @@
+                return;
+            }
+            template = hand.clone();
+            template.setAmount(1);
+        } else if (existing.item != null && itemText.equalsIgnoreCase(displayItem(existing.item))) {
+            template = existing.item.clone();
+            template.setAmount(1);
+        } else {
+            Material material = Material.matchMaterial(itemText.replace(' ', '_'));
+            if (material == null || material == Material.AIR || !material.isItem()) {
+                event.setCancelled(true);
+                renderShopSign(existing);
+                msg(player, "§cUnknown item on line 3: " + itemText + ". Keep the current name, use ?, or type a material name.");
+                return;
+            }
+            template = new ItemStack(material, 1);
+        }
+
+        Shop updated = new Shop(existing.signKey, existing.containerKey, existing.owner, existing.ownerName,
+                existing.admin, existing.createdByAdmin, existing.creator, existing.creatorName,
+                amount, prices.buy, prices.sell, template);
+        removeShop(existing);
+        addShop(updated);
+        saveShop(updated);
+        saveShops();
+        setDisplayLines(event, updated);
+        msg(player, "§aShop updated. §7Line 4 is always reset to the real seller name.");
+    }
+
+    private PricePair parseFriendlyEditPrices(String mode, String priceLine) {
+        if (mode.equalsIgnoreCase("[BUY]")) {
+            Double price = parseSingleDisplayPrice(priceLine);
+            return price == null ? null : new PricePair(price, 0.0D);
+        }
+        if (mode.equalsIgnoreCase("[SELL]")) {
+            Double price = parseSingleDisplayPrice(priceLine);
+            return price == null ? null : new PricePair(0.0D, price);
+        }
+        if (mode.equalsIgnoreCase("[BUY AND SELL]")) {
+            PricePair pair = parsePrices(priceLine);
+            return pair != null && pair.buy > 0.0D && pair.sell > 0.0D ? pair : null;
+        }
+        return null;
+    }
+
+    private Double parseSingleDisplayPrice(String line) {
+        if (line == null || line.isBlank()) return null;
+        String value = stripColor(line).trim().replace(",", "");
+        int dollar = value.lastIndexOf('$');
+        if (dollar >= 0) value = value.substring(dollar + 1).trim();
+        else {
+            int colon = value.lastIndexOf(':');
+            if (colon >= 0) value = value.substring(colon + 1).trim();
+            else {
+                String[] parts = value.split("\\s+");
+                value = parts[parts.length - 1];
+            }
+        }
+        try {
+            double price = parsePrice(value);
+            return price > 0.0D ? price : null;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    private int lastAmountSeparator(String line) {
+        if (line == null) return -1;
+        String lower = line.toLowerCase(Locale.ROOT);
+        int at = lower.lastIndexOf(" x");
+        if (at < 0 || at + 2 >= line.length()) return -1;
+        String tail = line.substring(at + 2).trim();
+        if (tail.isEmpty()) return -1;
+        for (int i = 0; i < tail.length(); i++) if (!Character.isDigit(tail.charAt(i))) return -1;
+        return at;
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onInteract(PlayerInteractEvent event) {
+        if (event.getHand() != EquipmentSlot.HAND) return;
+        if (event.getAction() != Action.RIGHT_CLICK_BLOCK && event.getAction() != Action.LEFT_CLICK_BLOCK) return;
+        Block clicked = event.getClickedBlock();
+        if (clicked == null) return;
+        Player player = event.getPlayer();
+
+        Shop direct = shops.get(key(clicked.getLocation()));
+        if (direct != null && clicked.getState() instanceof Sign sign) {
+            renderShopSign(direct);
+            if (event.getAction() == Action.RIGHT_CLICK_BLOCK && player.isSneaking() && canManage(player, direct)) {
+                event.setCancelled(true);
+                beginEdit(player, sign, direct);
+                return;
+            }
+            if (event.getAction() == Action.LEFT_CLICK_BLOCK && player.isSneaking() && canManage(player, direct)) return;
+
+            event.setCancelled(true);
+            if (event.getAction() == Action.RIGHT_CLICK_BLOCK && direct.item == null && canAssignItem(player, direct)) {
+                assignHeldItem(player, direct);
+                return;
+            }
+            if (!player.hasPermission("leafchestshop.use")) {
+                msg(player, "§cYou do not have permission to use shops.");
+                return;
+            }
+            if (direct.item == null) {
+                msg(player, "§eThis shop does not have an item set yet.");
+                return;
+            }
+            boolean shopBuysOnly = direct.buy > 0.0D && direct.sell <= 0.0D;
+            boolean shopSellsOnly = direct.sell > 0.0D && direct.buy <= 0.0D;
+            if (shopBuysOnly) {
+                // One-way BUY shop: either click performs the only available transaction.
+                sell(player, direct);
+            } else if (shopSellsOnly) {
+                // One-way SELL shop: either click performs the only available transaction.
+                buy(player, direct);
+            } else if (event.getAction() == Action.RIGHT_CLICK_BLOCK) {
+                // Two-way shop: right-click buys from the shop.
+                buy(player, direct);
+            } else {
+                // Two-way shop: left-click sells to the shop.
+                sell(player, direct);
+            }
+            return;
+        }
+
+        if (clicked.getState() instanceof Container container) {
+            List<Shop> linked = shopsForInventory(container.getInventory());
+            if (linked.isEmpty()) return;
+            Shop shop = linked.get(0);
+            boolean owner = canManage(player, shop);
+            if (event.getAction() == Action.RIGHT_CLICK_BLOCK) {
+                if (owner && !player.isSneaking()) return;
+                event.setCancelled(true);
+                showShopInfo(player, shop);
+                return;
+            }
+            if (!owner) event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onBlockPlace(BlockPlaceEvent event) {
+        SpecialChestData data = readSpecialChest(event.getItemInHand());
+        if (data == null) return;
+        Player player = event.getPlayer();
+        if (!player.hasPermission("leafchestshop.admin")) {
+            event.setCancelled(true);
+            msg(player, "§cOnly admins can place special chest shop items.");
+            return;
+        }
+        if (!isAllowedShopContainer(event.getBlockPlaced())) {
+            event.setCancelled(true);
+            msg(player, "§cThat special item must place a chest shop container.");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onSpecialChestPlacedMonitor(BlockPlaceEvent event) {
+        SpecialChestData data = readSpecialChest(event.getItemInHand());
+        if (data == null || !event.getPlayer().hasPermission("leafchestshop.admin")) return;
+        Block block = event.getBlockPlaced();
+        if (!isAllowedShopContainer(block)) return;
+        PreparedChest prepared = new PreparedChest(data.admin, data.ownerName, data.creator, data.creatorName);
+        preparedContainers.put(key(block.getLocation()), prepared);
+        saveShops();
+        if (data.admin) {
+            msg(event.getPlayer(), "§aAdmin shop chest placed. Attach a wall sign and create the shop; stock will be unlimited.");
+        } else {
+            msg(event.getPlayer(), "§aOwned shop chest placed. The shop created on it will belong to §f" + data.ownerName + "§a.");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onBreak(BlockBreakEvent event) {
+        String brokenKey = key(event.getBlock().getLocation());
+        Shop direct = shops.get(brokenKey);
+        if (direct != null) {
+            if (!canDeleteShop(event.getPlayer(), direct)) {
+                event.setCancelled(true);
+                if (isToesProtected(direct)) msg(event.getPlayer(), "§cOnly toes__ can delete this admin chest shop.");
+                else msg(event.getPlayer(), "§cYou cannot break this shop sign.");
+                return;
+            }
+            removeShop(direct);
+            shopYaml.set("shops." + encodedPath(brokenKey), null);
+            saveShops();
+            msg(event.getPlayer(), "§eShop removed.");
+            return;
+        }
+
+        PreparedChest prepared = preparedContainers.get(brokenKey);
+        if (prepared != null) {
+            if (!event.getPlayer().hasPermission("leafchestshop.admin") && !prepared.isCreator(event.getPlayer())) {
+                event.setCancelled(true);
+                msg(event.getPlayer(), "§cThis prepared chest shop is protected.");
+                return;
+            }
+            preparedContainers.remove(brokenKey);
+            saveShops();
+            return;
+        }
+
+        List<Shop> attached;
+        if (event.getBlock().getState() instanceof Container container) attached = shopsForInventory(container.getInventory());
+        else attached = shopsUsingContainer(event.getBlock().getLocation());
+        if (!attached.isEmpty()) {
+            event.setCancelled(true);
+            msg(event.getPlayer(), "§cRemove the attached shop sign before breaking this container.");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onInventoryOpen(InventoryOpenEvent event) {
+        if (!(event.getPlayer() instanceof Player player)) return;
+        List<Shop> linked = shopsForInventory(event.getInventory());
+        if (linked.isEmpty()) return;
+        boolean allowed = player.hasPermission("leafchestshop.bypass") || player.hasPermission("leafchestshop.admin");
+        if (!allowed) {
+            for (Shop shop : linked) {
+                if (isActualOwner(player, shop)) {
+                    allowed = true;
+                    break;
+                }
+            }
+        }
+        if (!allowed) {
+            event.setCancelled(true);
+            msg(player, "§cThis shop container is protected.");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
+    public void onAdminGuiClick(InventoryClickEvent event) {
+        if (!(event.getWhoClicked() instanceof Player player)) return;
+        Integer pageObj = adminGuiPages.get(player.getUniqueId());
+        if (pageObj == null || !ADMIN_GUI_TITLE.equals(event.getView().getTitle())) return;
+        event.setCancelled(true);
+        if (event.getRawSlot() < 0 || event.getRawSlot() >= event.getView().getTopInventory().getSize()) return;
+        int page = pageObj;
+        int slot = event.getRawSlot();
+        List<Shop> adminShops = liveAdminShops();
+        int maxPage = Math.max(0, (adminShops.size() - 1) / ADMIN_GUI_PAGE_SIZE);
+
+        if (slot == 45 && page > 0) {
+            openAdminShopBrowser(player, page - 1);
+            return;
+        }
+        if (slot == 49) {
+            openAdminShopBrowser(player, Math.min(page, maxPage));
