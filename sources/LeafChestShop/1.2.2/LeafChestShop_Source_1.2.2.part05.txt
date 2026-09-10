@@ -1,0 +1,250 @@
+        if (item == null || item.getType() == Material.AIR) return null;
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null || !meta.hasLore()) return null;
+        List<String> lore = meta.getLore();
+        if (lore == null) return null;
+        for (String line : lore) {
+            if (line == null || !line.startsWith(SPECIAL_MARKER)) continue;
+            String payload = line.substring(SPECIAL_MARKER.length());
+            String[] parts = payload.split("\\|", -1);
+            try {
+                if (parts.length == 3 && parts[0].equals("A")) {
+                    return new SpecialChestData(true, null, UUID.fromString(parts[1]), parts[2]);
+                }
+                if (parts.length == 4 && parts[0].equals("O") && parts[1].matches("[A-Za-z0-9_]{1,16}")) {
+                    return new SpecialChestData(false, parts[1], UUID.fromString(parts[2]), parts[3]);
+                }
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private boolean addSingleItem(Inventory inventory, ItemStack item) {
+        return addExact(inventory, item, 1);
+    }
+
+    private void assignHeldItem(Player player, Shop shop) {
+        ItemStack hand = player.getInventory().getItemInMainHand();
+        if (hand == null || hand.getType() == Material.AIR) {
+            msg(player, "§eHold the item you want this shop to use, then right-click the sign.");
+            return;
+        }
+        ReentrantLock lock = shopLocks.computeIfAbsent(shop.signKey, k -> new ReentrantLock());
+        if (!lock.tryLock()) {
+            msg(player, "§eThat shop is busy. Try again.");
+            return;
+        }
+        try {
+            if (shop.item != null) return;
+            shop.item = hand.clone();
+            shop.item.setAmount(1);
+            saveShop(shop);
+            saveShops();
+            renderShopSign(shop);
+            msg(player, "§aShop item set to §f" + displayItem(shop.item) + "§a.");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private UUID resolveOfflineUuid(String name) {
+        if (name == null || name.isBlank()) return null;
+        try {
+            OfflinePlayer player = Bukkit.getOfflinePlayer(name);
+            return player == null ? null : player.getUniqueId();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private OfflinePlayer shopOwnerOffline(Shop shop) {
+        if (shop == null || shop.admin) return null;
+        if (shop.owner != null) return Bukkit.getOfflinePlayer(shop.owner);
+        if (shop.ownerName != null && !shop.ownerName.isBlank()) return Bukkit.getOfflinePlayer(shop.ownerName);
+        return null;
+    }
+
+    private boolean isActualOwner(Player player, Shop shop) {
+        if (shop.admin) {
+            if (shop.creator != null && shop.creator.equals(player.getUniqueId())) return true;
+            return shop.creatorName != null && shop.creatorName.equalsIgnoreCase(player.getName());
+        }
+        if (shop.owner != null && shop.owner.equals(player.getUniqueId())) return true;
+        return shop.ownerName != null && shop.ownerName.equalsIgnoreCase(player.getName());
+    }
+
+    private boolean canAssignItem(Player player, Shop shop) {
+        return isActualOwner(player, shop) || player.hasPermission("leafchestshop.admin") || player.hasPermission("leafchestshop.bypass");
+    }
+
+    private boolean canManage(Player player, Shop shop) {
+        return player.hasPermission("leafchestshop.bypass") || player.hasPermission("leafchestshop.admin") || isActualOwner(player, shop);
+    }
+
+    private boolean isToesProtected(Shop shop) {
+        return shop.createdByAdmin && shop.creatorName != null && shop.creatorName.equalsIgnoreCase("toes__");
+    }
+
+    private boolean canDeleteShop(Player player, Shop shop) {
+        if (isToesProtected(shop)) {
+            if (!player.getName().equalsIgnoreCase("toes__")) return false;
+            if (shop.creator != null && !shop.creator.equals(player.getUniqueId())) return false;
+        }
+        return canManage(player, shop);
+    }
+
+    private String creatorDisplay(Shop shop) {
+        if (shop.creatorName != null && !shop.creatorName.isBlank()) return shop.creatorName;
+        if (shop.creator != null) {
+            OfflinePlayer creator = Bukkit.getOfflinePlayer(shop.creator);
+            String name = creator.getName();
+            if (name != null && !name.isBlank()) return name;
+        }
+        return "Unknown (legacy shop)";
+    }
+
+    private PreparedMatch findPrepared(Container container) {
+        String direct = key(container.getLocation());
+        PreparedChest prepared = preparedContainers.get(direct);
+        if (prepared != null) return new PreparedMatch(direct, prepared);
+        InventoryHolder holder = container.getInventory().getHolder();
+        if (holder instanceof DoubleChest doubleChest) {
+            InventoryHolder left = doubleChest.getLeftSide();
+            InventoryHolder right = doubleChest.getRightSide();
+            if (left instanceof Container c) {
+                String k = key(c.getLocation());
+                PreparedChest p = preparedContainers.get(k);
+                if (p != null) return new PreparedMatch(k, p);
+            }
+            if (right instanceof Container c) {
+                String k = key(c.getLocation());
+                PreparedChest p = preparedContainers.get(k);
+                if (p != null) return new PreparedMatch(k, p);
+            }
+        }
+        return null;
+    }
+
+    private List<Shop> liveAdminShops() {
+        List<Shop> result = new ArrayList<>();
+        for (Shop shop : shops.values()) {
+            if (!shop.createdByAdmin) continue;
+            if (parseLocation(shop.signKey) == null || parseLocation(shop.containerKey) == null) continue;
+            result.add(shop);
+        }
+        result.sort(Comparator.comparing((Shop shop) -> creatorDisplay(shop), String.CASE_INSENSITIVE_ORDER).thenComparing(shop -> shop.signKey));
+        return result;
+    }
+
+    private void openAdminShopBrowser(Player player, int requestedPage) {
+        List<Shop> adminShops = liveAdminShops();
+        int maxPage = Math.max(0, (adminShops.size() - 1) / ADMIN_GUI_PAGE_SIZE);
+        int page = Math.max(0, Math.min(requestedPage, maxPage));
+        Inventory gui = Bukkit.createInventory(null, 54, ADMIN_GUI_TITLE);
+        int start = page * ADMIN_GUI_PAGE_SIZE;
+        for (int slot = 0; slot < ADMIN_GUI_PAGE_SIZE && start + slot < adminShops.size(); slot++) {
+            gui.setItem(slot, adminShopGuiItem(adminShops.get(start + slot), start + slot + 1));
+        }
+        if (page > 0) gui.setItem(45, namedGuiItem(Material.ARROW, "§ePrevious page", List.of("§7Page " + page + " of " + (maxPage + 1))));
+        gui.setItem(49, namedGuiItem(Material.PAPER, "§fAdmin Shops: §e" + adminShops.size(), List.of("§7Page " + (page + 1) + "/" + (maxPage + 1), "§7Click to refresh")));
+        if (page < maxPage) gui.setItem(53, namedGuiItem(Material.ARROW, "§eNext page", List.of("§7Page " + (page + 2) + " of " + (maxPage + 1))));
+        adminGuiPages.put(player.getUniqueId(), page);
+        player.openInventory(gui);
+    }
+
+    private ItemStack adminShopGuiItem(Shop shop, int number) {
+        ItemStack item = shop.item == null ? new ItemStack(Material.CHEST, 1) : shop.item.clone();
+        item.setAmount(1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) return item;
+        meta.setDisplayName("§cAdmin-created Shop #" + number + " §f- §e" + displayItem(shop.item));
+        List<String> lore = new ArrayList<>();
+        lore.add("§7Type: §f" + shopType(shop));
+        lore.add("§7Amount: §f" + shop.amount);
+        lore.add("§7BUY (shop buys): §f" + (shop.buy > 0.0D ? "$" + trimDouble(shop.buy) : "Disabled"));
+        lore.add("§7SELL (shop sells): §f" + (shop.sell > 0.0D ? "$" + trimDouble(shop.sell) : "Disabled"));
+        lore.add("§7Stock: " + (shop.admin ? "§aUnlimited" : "§fStored in chest"));
+        lore.add("§7Creator: §f" + creatorDisplay(shop));
+        Location loc = parseLocation(shop.containerKey);
+        if (loc != null && loc.getWorld() != null) {
+            lore.add("§7Location: §f" + loc.getWorld().getName() + " " + loc.getBlockX() + ", " + loc.getBlockY() + ", " + loc.getBlockZ());
+        }
+        if (isToesProtected(shop)) lore.add("§cProtected: only toes__ can delete this shop");
+        lore.add("");
+        lore.add("§aLeft-click: teleport above shop");
+        lore.add("§cRight-click: delete shop");
+        meta.setLore(lore);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private ItemStack namedGuiItem(Material material, String name, List<String> lore) {
+        ItemStack item = new ItemStack(material, 1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName(name);
+            meta.setLore(lore);
+            item.setItemMeta(meta);
+        }
+        return item;
+    }
+
+    private void teleportAboveShop(Player player, Shop shop) {
+        Location base = parseLocation(shop.containerKey);
+        if (base == null || base.getWorld() == null) {
+            msg(player, "§cThat shop's world is not currently available.");
+            return;
+        }
+        int x = base.getBlockX();
+        int y = base.getBlockY();
+        int z = base.getBlockZ();
+        Location destination = null;
+        for (int offset = 1; offset <= 6; offset++) {
+            Location feet = new Location(base.getWorld(), x + 0.5D, y + offset, z + 0.5D);
+            Location head = new Location(base.getWorld(), x + 0.5D, y + offset + 1, z + 0.5D);
+            if (feet.getBlock().getType() == Material.AIR && head.getBlock().getType() == Material.AIR) {
+                destination = feet;
+                break;
+            }
+        }
+        if (destination == null) destination = new Location(base.getWorld(), x + 0.5D, y + 2.0D, z + 0.5D);
+        adminGuiPages.remove(player.getUniqueId());
+        player.closeInventory();
+        if (!player.teleport(destination)) msg(player, "§cTeleport failed.");
+    }
+
+    private void deleteShopRecordAndSign(Shop shop) {
+        Location signLoc = parseLocation(shop.signKey);
+        removeShop(shop);
+        shopYaml.set("shops." + encodedPath(shop.signKey), null);
+        saveShops();
+        if (signLoc != null && signLoc.getBlock().getState() instanceof Sign) signLoc.getBlock().setType(Material.AIR);
+    }
+
+    private boolean isProtectedBlock(Block block) {
+        String k = key(block.getLocation());
+        if (shops.containsKey(k) || preparedContainers.containsKey(k)) return true;
+        if (block.getState() instanceof Container container && !shopsForInventory(container.getInventory()).isEmpty()) return true;
+        return !shopsUsingContainer(block.getLocation()).isEmpty();
+    }
+
+    private List<Shop> shopsUsingContainer(Location location) {
+        Set<String> signKeys = containerIndex.get(key(location));
+        if (signKeys == null || signKeys.isEmpty()) return List.of();
+        List<Shop> result = new ArrayList<>(signKeys.size());
+        for (String signKey : signKeys) {
+            Shop shop = shops.get(signKey);
+            if (shop != null) result.add(shop);
+        }
+        return result;
+    }
+
+    private List<Shop> shopsForInventory(Inventory inventory) {
+        Set<String> locationKeys = new HashSet<>();
+        InventoryHolder holder = inventory.getHolder();
+        if (holder instanceof Container container) {
+            locationKeys.add(key(container.getLocation()));
+        } else if (holder instanceof DoubleChest doubleChest) {
+            InventoryHolder left = doubleChest.getLeftSide();
