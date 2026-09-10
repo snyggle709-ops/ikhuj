@@ -1,0 +1,250 @@
+        openReason(player,action,target,0L);
+    }
+
+    private void performUiAction(Player player,String action,String target,long duration,String reason){closeUi(player);submitPunishment(player,action,target,duration,reason);}
+    private void submitRevokeUi(Player player,String type,String target){closeUi(player);commandRevoke(player,type,new String[]{target},"/");}
+
+    private void revokeHistoryItem(Player player,Punishment p,String target){
+        if(!p.isActive(System.currentTimeMillis()))return;
+        if(!Set.of("BAN","MUTE","BLACKLIST","WARN").contains(p.type))return;
+        String modName=senderName(player), modDisplay=moderatorDisplay(player);
+        Bukkit.getScheduler().runTaskAsynchronously(this,()->{
+            try{
+                int changed=database.deactivatePunishmentById(p.id);
+                if(p.type.equals("BAN")) changed+=database.deactivateInheritedBansByParent(p.id);
+                if(changed>0) database.insertAudit("UN"+p.type,p.targetUuid,target,modName,modDisplay,"Removed from moderation history UI");
+                final int count=changed;
+                sync(()->{player.sendMessage(PREFIX+(count>0?"§aAction removed.":"§eThat action is no longer active."));openHistoryAsync(player,target);});
+            }catch(Throwable t){asyncError(player,t);}
+        });
+    }
+
+    private void handlePrompt(Player player,Prompt prompt,String input){
+        if(input.equalsIgnoreCase("cancel")){openMain(player);return;}
+        switch(prompt.type){
+            case "TARGET"->continueUiForTarget(player,prompt.action,input);
+            case "DURATION"->{long d=parseDuration(input);if(d==Long.MIN_VALUE||d==0){player.sendMessage(PREFIX+"§cInvalid duration. Try again from /moderate.");return;}openReason(player,prompt.action,prompt.target,d);}
+            case "REASON"->{if(settings.requireReasons&&input.isBlank()){player.sendMessage(PREFIX+"§cA reason is required.");return;}performUiAction(player,prompt.action,prompt.target,prompt.duration,normalizeReason(input));}
+            case "CONFIG_SERVER"->updateSettingUi(player,"server_name",limit(input,48));
+            case "CONFIG_DISCORD"->updateSettingUi(player,"discord_url",limit(input,255));
+            case "CONFIG_MODGROUPS"->updateSettingUi(player,"moderator_groups",normalizeCsv(input));
+            case "CONFIG_ALERTGROUPS"->updateSettingUi(player,"alert_groups",normalizeCsv(input));
+            case "CONFIG_MUTECMDS"->updateSettingUi(player,"mute_blocked_commands",normalizeCsv(input));
+        }
+    }
+
+    private void sendHistoryText(CommandSender sender,String target){UUID targetUuid=knownUuid(target);Bukkit.getScheduler().runTaskAsynchronously(this,()->{try{List<Punishment> list=database.history(targetUuid,target,30);sync(()->{sender.sendMessage(PREFIX+"§6History for §f"+target+"§6:");for(Punishment p:list)sender.sendMessage("§8- §f"+p.type+" §7"+formatDate(p.createdAt)+" §8• §f"+p.reason+" §8• "+(p.isActive(System.currentTimeMillis())?"§aACTIVE":"§8inactive"));});}catch(Throwable t){asyncError(sender,t);}});}
+    private void sendWarningsText(CommandSender sender,String target){UUID targetUuid=knownUuid(target);Bukkit.getScheduler().runTaskAsynchronously(this,()->{try{List<Punishment> list=database.activeWarnings(targetUuid,target);sync(()->{sender.sendMessage(PREFIX+"§eWarnings for §f"+target+"§e: §f"+list.size());for(Punishment p:list){String remaining=p.expiresAt==0?"forever":formatDuration(Math.max(0L,p.expiresAt-System.currentTimeMillis()));sender.sendMessage("§e⚠ §f"+p.id+" §7"+p.reason+" §8("+formatDate(p.createdAt)+", "+remaining+" remaining)");}});}catch(Throwable t){asyncError(sender,t);}});}
+
+    private void moderatorHelp(CommandSender sender){
+        sender.sendMessage("§6§lWorldsGreatestModeration §8• §fCommands");
+        sender.sendMessage("§e/moderate §7- Open the moderation control center");
+        sender.sendMessage("§e/ban <user> <duration> [reason]");
+        sender.sendMessage("§e/unban <user> [reason]");
+        sender.sendMessage("§e/mute <user> <duration> [reason]");
+        sender.sendMessage("§e/unmute <user> [reason]");
+        sender.sendMessage("§e/kick <user> [reason]");
+        sender.sendMessage("§e/blacklist <user> <duration> [reason]");
+        sender.sendMessage("§e/unblacklist <user> [reason]");
+        sender.sendMessage("§e/warn <user> <duration> [reason] §8• §e/unwarn <user> <id|all>");
+        sender.sendMessage("§e/warnings [user] §8• §e/viewmodhistory <user>");
+        sender.sendMessage("§e/config §7- OP-only configuration UI");
+        sender.sendMessage("§7Durations: §f10s 10m 2h 3d 2w 1mo 1y forever §8(combinations supported)");
+    }
+
+    private boolean reasonAllowed(CommandSender sender,String reason){if(settings.requireReasons&&(reason==null||reason.isBlank())){sender.sendMessage(PREFIX+"§cA reason is required by configuration.");return false;}return true;}
+    private void noPermission(CommandSender sender){sender.sendMessage(PREFIX+"§cYou are not a configured moderator.");}
+
+    private boolean isModerator(CommandSender sender){
+        if(!(sender instanceof Player p))return true;
+        if(p.isOp()||p.hasPermission("worldsgreatestmoderation.moderator"))return true;
+        return lpInGroups(p,settings.moderatorGroups);
+    }
+    private boolean shouldReceiveAlert(Player p){return p.isOp()||p.hasPermission("worldsgreatestmoderation.alerts")||lpInGroups(p,settings.alertGroups);}
+
+    private boolean lpInGroups(Player player,Set<String> groups){
+        if(groups.isEmpty())return false;
+        try{
+            Class<?> provider=Class.forName("net.luckperms.api.LuckPermsProvider");Object api=provider.getMethod("get").invoke(null);
+            Object um=api.getClass().getMethod("getUserManager").invoke(api);Object user=um.getClass().getMethod("getUser",UUID.class).invoke(um,player.getUniqueId());if(user==null)return false;
+            String primary=String.valueOf(user.getClass().getMethod("getPrimaryGroup").invoke(user)).toLowerCase(Locale.ROOT);if(groups.contains(primary))return true;
+            try{Object q=user.getClass().getMethod("getQueryOptions").invoke(user);Object inherited=null;for(Method gm:user.getClass().getMethods()){if(gm.getName().equals("getInheritedGroups")&&gm.getParameterCount()==1){inherited=gm.invoke(user,q);break;}}if(inherited instanceof Iterable<?> it){for(Object g:it){String n=String.valueOf(g.getClass().getMethod("getName").invoke(g)).toLowerCase(Locale.ROOT);if(groups.contains(n))return true;}}}catch(Throwable ignored){}
+        }catch(Throwable ignored){}
+        return false;
+    }
+
+    private String moderatorDisplay(CommandSender sender){
+        if(!(sender instanceof Player p))return "§7[CONSOLE] Console";
+        try{
+            Class<?> provider=Class.forName("net.luckperms.api.LuckPermsProvider");Object api=provider.getMethod("get").invoke(null);Object um=api.getClass().getMethod("getUserManager").invoke(api);Object user=um.getClass().getMethod("getUser",UUID.class).invoke(um,p.getUniqueId());
+            if(user!=null){String primary=String.valueOf(user.getClass().getMethod("getPrimaryGroup").invoke(user));Object cached=user.getClass().getMethod("getCachedData").invoke(user);Object meta=cached.getClass().getMethod("getMetaData").invoke(cached);Object prefix=meta.getClass().getMethod("getPrefix").invoke(meta);String pre=prefix==null?"":miniToLegacy(String.valueOf(prefix));if(pre.isBlank())pre="§7["+primary.toUpperCase(Locale.ROOT)+"]";return pre+" §f"+p.getName();}
+        }catch(Throwable ignored){}
+        return "§7[MODERATOR] §f"+p.getName();
+    }
+
+    private String senderName(CommandSender sender){return sender instanceof Player p?p.getName():sender.getName();}
+
+    private String banMessage(Punishment p,boolean evasion){
+        StringBuilder s=new StringBuilder();s.append("§cYou've been banned from §f").append(settings.serverName).append(" §cby ").append(p.moderatorDisplay).append("§c.\n");
+        if(p.expiresAt==0)s.append("§cYou will §4§lNEVER§r§c be unbanned.\n");else s.append("§cYou will be unbanned in §e").append(formatDuration(Math.max(0,p.expiresAt-System.currentTimeMillis()))).append("§c.\n");
+        s.append("§7Reason for ban: §f").append(p.reason).append("\n");s.append("§7To appeal, join our discord server at §b§n").append(settings.discordUrl);return s.toString();
+    }
+    private String blacklistMessage(Punishment p,boolean alt){String reason=p.reason;StringBuilder s=new StringBuilder();s.append("§4§lYou've been BLACKLISTED from §f").append(settings.serverName).append(" §4by ").append(p.moderatorDisplay).append("§4.\n");if(p.expiresAt==0)s.append("§4You will §lNEVER§r§4 be unblacklisted.\n");else s.append("§4You will be unblacklisted in §e").append(formatDuration(Math.max(0L,p.expiresAt-System.currentTimeMillis()))).append("§4.\n");s.append("§7Reason for blacklist: §f").append(reason).append("\n");s.append("§7To appeal, join our discord server at §b§n").append(settings.discordUrl);return s.toString();}
+    private String kickMessage(Punishment p){return "§cYou were kicked by "+p.moderatorDisplay+"§c\n§7Reason: §f"+p.reason;}
+    private String muteMessage(Punishment p){if(p.expiresAt==0)return "§cYou may §4§lNEVER§r§c speak again.";return "§cYou may speak again in §e"+formatDuration(Math.max(0,p.expiresAt-System.currentTimeMillis()))+"§c.";}
+
+    private void disallowRich(AsyncPlayerPreLoginEvent event,String message){
+        try{Object component=adventureMessage(message,settings.discordUrl);for(Method m:event.getClass().getMethods()){if(m.getName().equals("disallow")&&m.getParameterCount()==2&&m.getParameterTypes()[0].getName().endsWith("AsyncPlayerPreLoginEvent$Result")&&m.getParameterTypes()[1].getName().equals("net.kyori.adventure.text.Component")){m.invoke(event,AsyncPlayerPreLoginEvent.Result.KICK_BANNED,component);return;}}}catch(Throwable ignored){}
+        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED,message);
+    }
+    private void kickSync(Player player,String message){sync(()->kickRich(player,message));}
+    private void kickByIdSync(UUID uuid,String message){sync(()->{Player p=Bukkit.getPlayer(uuid);if(p!=null)kickRich(p,message);});}
+    private void kickRich(Player player,String message){
+        try{Object component=adventureMessage(message,settings.discordUrl);for(Method m:player.getClass().getMethods()){if(m.getName().equals("kick")&&m.getParameterCount()==1&&m.getParameterTypes()[0].getName().equals("net.kyori.adventure.text.Component")){m.invoke(player,component);return;}}}catch(Throwable ignored){}
+        player.kickPlayer(message);
+    }
+    private Object adventureMessage(String legacy,String url)throws Exception{
+        Class<?> ser=Class.forName("net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer");Object serializer=ser.getMethod("legacySection").invoke(null);
+        Method deserialize=serializer.getClass().getMethod("deserialize",String.class);
+        int idx=url==null?-1:legacy.indexOf(url);if(idx<0)return deserialize.invoke(serializer,legacy);
+        Object before=deserialize.invoke(serializer,legacy.substring(0,idx));Object link=deserialize.invoke(serializer,"§b§n"+url);Object after=deserialize.invoke(serializer,legacy.substring(idx+url.length()));
+        Class<?> component=Class.forName("net.kyori.adventure.text.Component");Class<?> click=Class.forName("net.kyori.adventure.text.event.ClickEvent");Object ce=click.getMethod("openUrl",String.class).invoke(null,url);link=component.getMethod("clickEvent",click).invoke(link,ce);Object out=component.getMethod("append",component).invoke(before,link);return component.getMethod("append",component).invoke(out,after);
+    }
+    private void resolveClientToken(Player player, java.util.function.Consumer<String> callback) {
+        try {
+            Class<?> keyType = Class.forName("org.bukkit.NamespacedKey");
+            Object key = keyType.getMethod("fromString", String.class).invoke(null, "worldsgreatestmoderation:identity");
+            if (key == null) { callback.accept(null); return; }
+            Method retrieve = player.getClass().getMethod("retrieveCookie", keyType);
+            Object result = retrieve.invoke(player, key);
+            if (!(result instanceof java.util.concurrent.CompletableFuture<?> future)) { callback.accept(null); return; }
+            final Object cookieKey = key;
+            future.orTimeout(1500L, java.util.concurrent.TimeUnit.MILLISECONDS).whenComplete((raw, error) -> {
+                if (error != null) { callback.accept(null); return; }
+                try {
+                    byte[] token = raw instanceof byte[] bytes ? bytes : null;
+                    if (token == null || token.length < 16) {
+                        token = new byte[32];
+                        new SecureRandom().nextBytes(token);
+                        final byte[] toStore = token.clone();
+                        sync(() -> {
+                            Player live = Bukkit.getPlayer(player.getUniqueId());
+                            if (live == null) return;
+                            try {
+                                live.getClass().getMethod("storeCookie", keyType, byte[].class).invoke(live, cookieKey, toStore);
+                            } catch (Throwable ignored) {}
+                        });
+                    }
+                    callback.accept(hmacBytes(token));
+                } catch (Throwable t) {
+                    callback.accept(null);
+                }
+            });
+        } catch (Throwable t) {
+            callback.accept(null);
+        }
+    }
+
+    private String clientFingerprint(Player player) {
+        try {
+            StringBuilder b = new StringBuilder();
+            appendReflective(b, player, "getClientBrandName");
+            appendReflective(b, player, "getLocale");
+            appendReflective(b, player, "getClientViewDistance");
+            appendReflective(b, player, "getMainHand");
+
+            try {
+                Class<?> clientOption = Class.forName("com.destroystokyo.paper.ClientOption");
+                Method getter = player.getClass().getMethod("getClientOption", clientOption);
+                for (String field : List.of("SKIN_PARTS", "CHAT_COLORS_ENABLED", "CHAT_VISIBILITY", "LOCALE", "MAIN_HAND", "VIEW_DISTANCE", "TEXT_FILTERING_ENABLED", "ALLOW_SERVER_LISTINGS", "PARTICLE_VISIBILITY")) {
+                    try {
+                        Object option = clientOption.getField(field).get(null);
+                        Object value = getter.invoke(player, option);
+                        if (value != null && field.equals("SKIN_PARTS")) {
+                            try { value = value.getClass().getMethod("getRaw").invoke(value); } catch (Throwable ignored) {}
+                        }
+                        b.append(field).append('=').append(value).append(';');
+                    } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
+
+            try {
+                Method m = player.getClass().getMethod("getListeningPluginChannels");
+                Object v = m.invoke(player);
+                if (v instanceof Collection<?> c) {
+                    List<String> channels = new ArrayList<>();
+                    for (Object x : c) if (x != null) channels.add(String.valueOf(x));
+                    Collections.sort(channels);
+                    b.append("channels=").append(String.join(",", channels)).append(';');
+                }
+            } catch (Throwable ignored) {}
+
+            return b.length() == 0 ? null : hmac(b.toString());
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private void appendReflective(StringBuilder b, Player player, String method) {
+        try {
+            Object v = player.getClass().getMethod(method).invoke(player);
+            b.append(method).append('=').append(v).append(';');
+        } catch (Throwable ignored) {}
+    }
+
+    private AddressIdentity addressIdentityFromPlayer(Player player) {
+        try {
+            if (player.getAddress() == null || player.getAddress().getAddress() == null) return new AddressIdentity(null, null, "UNKNOWN");
+            return addressIdentity(player.getAddress().getAddress());
+        } catch (Throwable t) {
+            return new AddressIdentity(null, null, "UNKNOWN");
+        }
+    }
+
+    private InetAddress rawPreLoginAddress(AsyncPlayerPreLoginEvent event) {
+        try {
+            Object value = event.getClass().getMethod("getRawAddress").invoke(event);
+            return value instanceof InetAddress a ? a : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private AddressIdentity addressIdentity(InetAddress address) {
+        if (address == null) return new AddressIdentity(null, null, "UNKNOWN");
+        String scope;
+        if (address.isLoopbackAddress() || address.isAnyLocalAddress()) scope = "LOOPBACK";
+        else if (address.isSiteLocalAddress()) scope = "PRIVATE";
+        else if (address.isLinkLocalAddress()) scope = "LINK_LOCAL";
+        else if (address.isMulticastAddress()) scope = "MULTICAST";
+        else scope = "PUBLIC";
+        return new AddressIdentity(hashIp(address), hashNetwork(address), scope);
+    }
+
+    private String hashIp(InetAddress address) {
+        if (address == null) return null;
+        String hash = hmac(address.getHostAddress());
+        if (address.isLoopbackAddress() || address.isAnyLocalAddress()) return "L" + hash.substring(1);
+        if (address.isLinkLocalAddress() || address.isSiteLocalAddress() || address.isMulticastAddress()) return "R" + hash.substring(1);
+        return hash;
+    }
+
+    private String hashNetwork(InetAddress address) {
+        if (address == null) return null;
+        byte[] raw = address.getAddress().clone();
+        if (raw.length == 4) {
+            raw[3] = 0;
+        } else if (raw.length == 16) {
+            for (int i = 8; i < raw.length; i++) raw[i] = 0;
+        }
+        String marker = address.isLoopbackAddress() || address.isAnyLocalAddress() ? "LN:" : (address.isSiteLocalAddress() || address.isLinkLocalAddress() ? "RN:" : "PN:");
+        return marker + hmacBytes(raw);
+    }
+
+    private boolean serverOnlineMode() {
+        try {
+            Object server = Bukkit.class.getMethod("getServer").invoke(null);
+            Object result = server.getClass().getMethod("getOnlineMode").invoke(server);
+            return result instanceof Boolean b && b;
+        } catch (Throwable ignored) {
+            return true;
