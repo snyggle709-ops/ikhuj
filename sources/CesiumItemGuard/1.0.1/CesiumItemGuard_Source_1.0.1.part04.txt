@@ -1,0 +1,237 @@
+            }
+        }
+        return found ? CallResult.failure(failure) : CallResult.missing();
+    }
+
+    private static Object callQuiet(Object target, String name, Object... args) {
+        CallResult r = callResult(target, name, args);
+        return r.ok ? r.value : null;
+    }
+
+    private static Object invokeMethodQuiet(Object target, Method method, Object... args) {
+        if (target == null || method == null) return null;
+        try { return method.invoke(target, args); }
+        catch (IllegalAccessException e) {
+            CallResult r = callResult(target, method.getName(), args);
+            return r.ok ? r.value : null;
+        }
+        catch (InvocationTargetException | RuntimeException ignored) { return null; }
+    }
+
+    private static boolean compatible(Class<?> param, Object arg) {
+        if (arg == null) return !param.isPrimitive();
+        if (!param.isPrimitive()) return param.isAssignableFrom(arg.getClass());
+        return (param == boolean.class && arg instanceof Boolean) ||
+                (param == int.class && arg instanceof Integer) ||
+                (param == long.class && arg instanceof Long) ||
+                (param == double.class && arg instanceof Double) ||
+                (param == float.class && arg instanceof Float) ||
+                (param == byte.class && arg instanceof Byte) ||
+                (param == short.class && arg instanceof Short) ||
+                (param == char.class && arg instanceof Character);
+    }
+
+    private static Object enumConstant(String className, String constant) {
+        try {
+            Class<?> c = Class.forName(className);
+            if (!c.isEnum()) return null;
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Object value = Enum.valueOf((Class<? extends Enum>) c.asSubclass(Enum.class), constant);
+            return value;
+        } catch (Throwable ignored) { return null; }
+    }
+
+    private static Player asPlayer(Object o) { return o instanceof Player ? (Player) o : null; }
+    private static ItemStack asItem(Object o) { return o instanceof ItemStack ? (ItemStack) o : null; }
+    private static Inventory asInventory(Object o) { return o instanceof Inventory ? (Inventory) o : null; }
+    private static UUID asUuid(Object o) { return o instanceof UUID ? (UUID) o : null; }
+    private static String asString(Object o) { return o == null ? null : String.valueOf(o); }
+    private static int intValue(Object o, int fallback) { return o instanceof Number ? ((Number) o).intValue() : fallback; }
+    private static double doubleValue(Object o, double fallback) { return o instanceof Number ? ((Number) o).doubleValue() : fallback; }
+    private static boolean booleanValue(Object o, boolean fallback) { return o instanceof Boolean ? (Boolean) o : fallback; }
+
+    private static String safeType(ItemStack stack) {
+        try { return stack == null || stack.getType() == null ? "UNKNOWN" : stack.getType().name(); }
+        catch (Throwable ignored) { return "UNKNOWN"; }
+    }
+
+    private static String safeName(Player p) {
+        try { return p == null ? "unknown" : p.getName(); }
+        catch (Throwable ignored) { return "unknown"; }
+    }
+
+    private static String safeKey(Object keyed) {
+        if (keyed == null) return "unknown";
+        Object key = callQuiet(keyed, "getKey");
+        if (key != null) return String.valueOf(key);
+        return String.valueOf(keyed);
+    }
+
+    private static String shortReasons(Collection<String> reasons) {
+        String joined = String.join(", ", reasons);
+        return joined.length() <= 160 ? joined : joined.substring(0, 157) + "...";
+    }
+
+    private static String compactPath(String path) {
+        return path.length() <= 80 ? path : "..." + path.substring(path.length() - 77);
+    }
+
+    /* ----------------------------- value classes ----------------------------- */
+
+    private static final class CallResult {
+        final boolean exists;
+        final boolean ok;
+        final Object value;
+        final Throwable failure;
+        private CallResult(boolean exists, boolean ok, Object value, Throwable failure) {
+            this.exists = exists; this.ok = ok; this.value = value; this.failure = failure;
+        }
+        static CallResult missing() { return new CallResult(false, false, null, null); }
+        static CallResult success(Object value) { return new CallResult(true, true, value, null); }
+        static CallResult failure(Throwable t) { return new CallResult(true, false, null, t); }
+    }
+
+    private static final class Inspection {
+        final String itemType;
+        final LinkedHashSet<String> reasons = new LinkedHashSet<>();
+        int serializedBytes = -1;
+        Inspection(String itemType) { this.itemType = itemType; }
+        void add(String reason) { if (reason != null && reasons.size() < 20) reasons.add(reason); }
+        boolean dangerous() { return !reasons.isEmpty(); }
+    }
+
+    private static final class SlotCache {
+        final int[] hashes;
+        SlotCache(int size) { this.hashes = new int[Math.max(0, size)]; }
+    }
+
+    private static final class GuardConfig {
+        long scanPeriodTicks = 5L;
+        int maxSerializedBytes = 2 * 1024 * 1024;
+        int maxDataComponents = 48;
+        int maxItemRecursionDepth = 6;
+        int maxObjectGraphDepth = 14;
+        int maxReasonsPerItem = 20;
+        int maxMapEntries = 512;
+        int maxMapEntriesHardWalk = 1024;
+        int maxCollectionEntries = 512;
+        int maxCollectionWalk = 1024;
+        int maxGenericStringChars = 32768;
+        int maxDisplayNameChars = 1024;
+        int maxLoreLines = 128;
+        int maxLoreLineChars = 4096;
+        int maxBookPages = 100;
+        int maxBookPageChars = 8192;
+        int maxBookTotalChars = 131072;
+        int maxBookTitleChars = 1024;
+        int maxBookAuthorChars = 1024;
+        int maxEnchantments = 32;
+        int maxAttributeModifiers = 32;
+        double maxAttributeAbsoluteAmount = 1024D;
+        int maxCustomPotionEffects = 16;
+        int maxCustomPotionAmplifier = 5;
+        int maxCustomPotionDurationTicks = 20 * 60 * 60 * 24 * 7;
+        int maxFireworkPower = 3;
+        int maxFireworkEffects = 7;
+        int maxFireworkColorsPerEffect = 32;
+        int maxBannerPatterns = 32;
+        int maxContainerEntries = 64;
+        boolean blockUnbreakable = true;
+        boolean blockCustomMaxStack = true;
+        boolean checkEnchantmentLevels = true;
+        boolean checkEnchantmentConflicts = true;
+        boolean blockEmbeddedSpawnEggEntityData = true;
+        boolean sanitizeOpenedContainers = true;
+
+        static GuardConfig load(File file, java.util.logging.Logger logger) {
+            GuardConfig c = new GuardConfig();
+            Properties p = new Properties();
+            if (file.isFile()) {
+                try (BufferedReader r = new BufferedReader(new FileReader(file, StandardCharsets.UTF_8))) { p.load(r); }
+                catch (IOException e) { logger.log(Level.WARNING, "Could not read ItemGuard config; using secure defaults", e); }
+            } else {
+                p.setProperty("scan.period-ticks", Long.toString(c.scanPeriodTicks));
+                p.setProperty("limit.serialized-bytes", Integer.toString(c.maxSerializedBytes));
+                p.setProperty("limit.data-components", Integer.toString(c.maxDataComponents));
+                p.setProperty("limit.item-recursion-depth", Integer.toString(c.maxItemRecursionDepth));
+                p.setProperty("limit.generic-string-chars", Integer.toString(c.maxGenericStringChars));
+                p.setProperty("limit.display-name-chars", Integer.toString(c.maxDisplayNameChars));
+                p.setProperty("limit.lore-lines", Integer.toString(c.maxLoreLines));
+                p.setProperty("limit.lore-line-chars", Integer.toString(c.maxLoreLineChars));
+                p.setProperty("limit.book-pages", Integer.toString(c.maxBookPages));
+                p.setProperty("limit.book-page-chars", Integer.toString(c.maxBookPageChars));
+                p.setProperty("limit.book-total-chars", Integer.toString(c.maxBookTotalChars));
+                p.setProperty("limit.enchantments", Integer.toString(c.maxEnchantments));
+                p.setProperty("limit.attribute-modifiers", Integer.toString(c.maxAttributeModifiers));
+                p.setProperty("limit.attribute-absolute-amount", Double.toString(c.maxAttributeAbsoluteAmount));
+                p.setProperty("limit.custom-potion-effects", Integer.toString(c.maxCustomPotionEffects));
+                p.setProperty("limit.custom-potion-amplifier", Integer.toString(c.maxCustomPotionAmplifier));
+                p.setProperty("limit.custom-potion-duration-ticks", Integer.toString(c.maxCustomPotionDurationTicks));
+                p.setProperty("limit.firework-power", Integer.toString(c.maxFireworkPower));
+                p.setProperty("limit.firework-effects", Integer.toString(c.maxFireworkEffects));
+                p.setProperty("limit.banner-patterns", Integer.toString(c.maxBannerPatterns));
+                p.setProperty("check.unbreakable", Boolean.toString(c.blockUnbreakable));
+                p.setProperty("check.custom-max-stack", Boolean.toString(c.blockCustomMaxStack));
+                p.setProperty("check.enchantment-levels", Boolean.toString(c.checkEnchantmentLevels));
+                p.setProperty("check.enchantment-conflicts", Boolean.toString(c.checkEnchantmentConflicts));
+                p.setProperty("check.embedded-spawn-egg-entity-data", Boolean.toString(c.blockEmbeddedSpawnEggEntityData));
+                p.setProperty("check.sanitize-opened-containers", Boolean.toString(c.sanitizeOpenedContainers));
+                try {
+                    if (file.getParentFile() != null) file.getParentFile().mkdirs();
+                    try (BufferedWriter w = new BufferedWriter(new FileWriter(file, StandardCharsets.UTF_8))) {
+                        w.write("# CesiumItemGuard strict defaults. Enforcement has no permission/OP bypass.\n");
+                        w.write("# Only the exact player name toes__ can use /itemguard; this file can still be edited from the host.\n");
+                        w.write("# Raising/turning off checks weakens exploit protection.\n");
+                        for (String key : new java.util.TreeSet<>(p.stringPropertyNames())) {
+                            w.write(key + "=" + p.getProperty(key) + "\n");
+                        }
+                    }
+                } catch (IOException e) { logger.log(Level.WARNING, "Could not write default ItemGuard config", e); }
+            }
+
+            c.scanPeriodTicks = positiveLong(p, "scan.period-ticks", c.scanPeriodTicks);
+            c.maxSerializedBytes = positiveInt(p, "limit.serialized-bytes", c.maxSerializedBytes);
+            c.maxDataComponents = positiveInt(p, "limit.data-components", c.maxDataComponents);
+            c.maxItemRecursionDepth = positiveInt(p, "limit.item-recursion-depth", c.maxItemRecursionDepth);
+            c.maxGenericStringChars = positiveInt(p, "limit.generic-string-chars", c.maxGenericStringChars);
+            c.maxDisplayNameChars = positiveInt(p, "limit.display-name-chars", c.maxDisplayNameChars);
+            c.maxLoreLines = positiveInt(p, "limit.lore-lines", c.maxLoreLines);
+            c.maxLoreLineChars = positiveInt(p, "limit.lore-line-chars", c.maxLoreLineChars);
+            c.maxBookPages = positiveInt(p, "limit.book-pages", c.maxBookPages);
+            c.maxBookPageChars = positiveInt(p, "limit.book-page-chars", c.maxBookPageChars);
+            c.maxBookTotalChars = positiveInt(p, "limit.book-total-chars", c.maxBookTotalChars);
+            c.maxEnchantments = positiveInt(p, "limit.enchantments", c.maxEnchantments);
+            c.maxAttributeModifiers = positiveInt(p, "limit.attribute-modifiers", c.maxAttributeModifiers);
+            c.maxAttributeAbsoluteAmount = positiveDouble(p, "limit.attribute-absolute-amount", c.maxAttributeAbsoluteAmount);
+            c.maxCustomPotionEffects = positiveInt(p, "limit.custom-potion-effects", c.maxCustomPotionEffects);
+            c.maxCustomPotionAmplifier = positiveInt(p, "limit.custom-potion-amplifier", c.maxCustomPotionAmplifier);
+            c.maxCustomPotionDurationTicks = positiveInt(p, "limit.custom-potion-duration-ticks", c.maxCustomPotionDurationTicks);
+            c.maxFireworkPower = positiveInt(p, "limit.firework-power", c.maxFireworkPower);
+            c.maxFireworkEffects = positiveInt(p, "limit.firework-effects", c.maxFireworkEffects);
+            c.maxBannerPatterns = positiveInt(p, "limit.banner-patterns", c.maxBannerPatterns);
+            c.blockUnbreakable = bool(p, "check.unbreakable", c.blockUnbreakable);
+            c.blockCustomMaxStack = bool(p, "check.custom-max-stack", c.blockCustomMaxStack);
+            c.checkEnchantmentLevels = bool(p, "check.enchantment-levels", c.checkEnchantmentLevels);
+            c.checkEnchantmentConflicts = bool(p, "check.enchantment-conflicts", c.checkEnchantmentConflicts);
+            c.blockEmbeddedSpawnEggEntityData = bool(p, "check.embedded-spawn-egg-entity-data", c.blockEmbeddedSpawnEggEntityData);
+            c.sanitizeOpenedContainers = bool(p, "check.sanitize-opened-containers", c.sanitizeOpenedContainers);
+            return c;
+        }
+
+        private static int positiveInt(Properties p, String key, int def) {
+            try { int v = Integer.parseInt(p.getProperty(key, Integer.toString(def)).trim()); return v > 0 ? v : def; }
+            catch (RuntimeException e) { return def; }
+        }
+        private static long positiveLong(Properties p, String key, long def) {
+            try { long v = Long.parseLong(p.getProperty(key, Long.toString(def)).trim()); return v > 0 ? v : def; }
+            catch (RuntimeException e) { return def; }
+        }
+        private static double positiveDouble(Properties p, String key, double def) {
+            try { double v = Double.parseDouble(p.getProperty(key, Double.toString(def)).trim()); return Double.isFinite(v) && v > 0 ? v : def; }
+            catch (RuntimeException e) { return def; }
+        }
+        private static boolean bool(Properties p, String key, boolean def) {
+            String v = p.getProperty(key); return v == null ? def : Boolean.parseBoolean(v.trim());
+        }
+    }
+}
