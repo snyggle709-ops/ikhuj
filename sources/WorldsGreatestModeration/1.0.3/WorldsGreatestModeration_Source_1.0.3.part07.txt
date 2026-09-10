@@ -1,0 +1,100 @@
+            if (uuid == null) return;
+            try (Connection c = open(); PreparedStatement p = c.prepareStatement("INSERT INTO wgm_sessions(id,uuid,ip_hash,network_hash,fingerprint_hash,joined_at,left_at) VALUES(?,?,?,?,?,?,?)")) {
+                p.setString(1, UUID.randomUUID().toString()); p.setString(2, uuid.toString()); p.setString(3, ipHash); p.setString(4, networkHash); p.setString(5, fp); p.setLong(6, joinedAt); p.setLong(7, 0L); p.executeUpdate();
+            }
+        }
+
+        void endOpenSessions(UUID uuid, long leftAt) throws SQLException {
+            if (uuid == null) return;
+            try (Connection c = open(); PreparedStatement p = c.prepareStatement("UPDATE wgm_sessions SET left_at=? WHERE uuid=? AND left_at=0")) {
+                p.setLong(1, leftAt); p.setString(2, uuid.toString()); p.executeUpdate();
+            }
+        }
+
+        boolean hasHistoricalConcurrency(UUID a, UUID b, long before) throws SQLException {
+            if (a == null || b == null || before <= 0L) return false;
+            String sql = "SELECT 1 FROM wgm_sessions a JOIN wgm_sessions b ON a.uuid<>b.uuid WHERE a.uuid=? AND b.uuid=? AND a.left_at>a.joined_at AND b.left_at>b.joined_at AND a.joined_at<? AND b.joined_at<? AND LEAST(a.left_at,b.left_at)-GREATEST(a.joined_at,b.joined_at)>=60000";
+            try (Connection c = open(); PreparedStatement p = c.prepareStatement(sql)) {
+                p.setString(1, a.toString()); p.setString(2, b.toString()); p.setLong(3, before); p.setLong(4, before);
+                try (ResultSet r = p.executeQuery()) { return r.next(); }
+            }
+        }
+
+        int fingerprintAccountCount(String fp) throws SQLException {
+            if (fp == null) return 0;
+            try (Connection c = open(); PreparedStatement p = c.prepareStatement("SELECT COUNT(DISTINCT uuid) FROM wgm_observations WHERE fingerprint_hash=?")) {
+                p.setString(1, fp); try (ResultSet r = p.executeQuery()) { return r.next() ? r.getInt(1) : 0; }
+            }
+        }
+
+        void observeClientToken(UUID uuid, String token) throws SQLException {
+            if (uuid == null || token == null) return;
+            long now = System.currentTimeMillis();
+            try (Connection c = open()) {
+                try (PreparedStatement u = c.prepareStatement("UPDATE wgm_client_tokens SET last_seen=? WHERE uuid=? AND token_hash=?")) {
+                    u.setLong(1, now); u.setString(2, uuid.toString()); u.setString(3, token);
+                    if (u.executeUpdate() > 0) return;
+                }
+                try (PreparedStatement q = c.prepareStatement("INSERT INTO wgm_client_tokens(uuid,token_hash,first_seen,last_seen) VALUES(?,?,?,?)")) {
+                    q.setString(1, uuid.toString()); q.setString(2, token); q.setLong(3, now); q.setLong(4, now); q.executeUpdate();
+                }
+            }
+        }
+
+        List<IdentityCandidate> findIdentityCandidates(UUID alt, String ip, String network, String fp, String token) throws SQLException {
+            LinkedHashMap<UUID, String> found = new LinkedHashMap<>();
+            if (ip != null || network != null || fp != null) {
+                List<String> conditions = new ArrayList<>();
+                if (ip != null) conditions.add("ip_hash=?");
+                if (network != null) conditions.add("network_hash=?");
+                if (fp != null) conditions.add("fingerprint_hash=?");
+                String sql = "SELECT uuid,MAX(username_display) AS username_display FROM wgm_observations WHERE uuid<>? AND (" + String.join(" OR ", conditions) + ") GROUP BY uuid";
+                try (Connection c = open(); PreparedStatement p = c.prepareStatement(sql)) {
+                    int i = 1;
+                    p.setString(i++, alt.toString());
+                    if (ip != null) p.setString(i++, ip);
+                    if (network != null) p.setString(i++, network);
+                    if (fp != null) p.setString(i++, fp);
+                    try (ResultSet r = p.executeQuery()) {
+                        while (r.next()) {
+                            UUID u = uuid(r.getString(1));
+                            if (u != null) found.put(u, r.getString(2));
+                        }
+                    }
+                }
+            }
+            if (token != null) {
+                try (Connection c = open(); PreparedStatement p = c.prepareStatement("SELECT DISTINCT uuid FROM wgm_client_tokens WHERE uuid<>? AND token_hash=?")) {
+                    p.setString(1, alt.toString()); p.setString(2, token);
+                    try (ResultSet r = p.executeQuery()) {
+                        while (r.next()) {
+                            UUID u = uuid(r.getString(1));
+                            if (u != null && !found.containsKey(u)) found.put(u, latestName(u));
+                        }
+                    }
+                }
+            }
+            List<IdentityCandidate> out = new ArrayList<>();
+            for (Map.Entry<UUID, String> e : found.entrySet()) out.add(new IdentityCandidate(e.getKey(), e.getValue()));
+            return out;
+        }
+
+        boolean hasIp(UUID uuid, String ip) throws SQLException { return exists("SELECT 1 FROM wgm_observations WHERE uuid=? AND ip_hash=?", uuid.toString(), ip); }
+        boolean hasNetwork(UUID uuid, String network) throws SQLException { return exists("SELECT 1 FROM wgm_observations WHERE uuid=? AND network_hash=?", uuid.toString(), network); }
+        boolean hasFingerprint(UUID uuid, String fp) throws SQLException { return exists("SELECT 1 FROM wgm_observations WHERE uuid=? AND fingerprint_hash=?", uuid.toString(), fp); }
+        boolean hasClientToken(UUID uuid, String token) throws SQLException { return exists("SELECT 1 FROM wgm_client_tokens WHERE uuid=? AND token_hash=?", uuid.toString(), token); }
+        boolean exists(String sql, String a, String b) throws SQLException { try (Connection c=open(); PreparedStatement p=c.prepareStatement(sql)) { p.setString(1,a); p.setString(2,b); try(ResultSet r=p.executeQuery()){ return r.next(); } } }
+
+        int commonIpCount(UUID a, UUID b) throws SQLException {
+            try (Connection c=open(); PreparedStatement p=c.prepareStatement("SELECT COUNT(DISTINCT a.ip_hash) FROM wgm_observations a JOIN wgm_observations b ON a.ip_hash=b.ip_hash WHERE a.uuid=? AND b.uuid=? AND a.ip_hash IS NOT NULL")) {
+                p.setString(1,a.toString()); p.setString(2,b.toString()); try(ResultSet r=p.executeQuery()){ return r.next()?r.getInt(1):0; }
+            }
+        }
+
+        int commonNetworkCount(UUID a, UUID b) throws SQLException {
+            try (Connection c=open(); PreparedStatement p=c.prepareStatement("SELECT COUNT(DISTINCT a.network_hash) FROM wgm_observations a JOIN wgm_observations b ON a.network_hash=b.network_hash WHERE a.uuid=? AND b.uuid=? AND a.network_hash IS NOT NULL")) {
+                p.setString(1,a.toString()); p.setString(2,b.toString()); try(ResultSet r=p.executeQuery()){ return r.next()?r.getInt(1):0; }
+            }
+        }
+
+        long firstSeen(UUID uuid) throws SQLException {
