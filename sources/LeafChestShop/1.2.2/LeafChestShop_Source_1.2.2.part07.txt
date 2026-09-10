@@ -1,0 +1,250 @@
+    private void reverseSaleTransfer(OfflinePlayer creditedSeller, OfflinePlayer debitedOwner, double amount, boolean hadOwnerDebit) {
+        boolean sellerDebit = withdraw(creditedSeller, amount);
+        boolean ownerRefund = !hadOwnerDebit || deposit(debitedOwner, amount);
+        if (!sellerDebit || !ownerRefund) {
+            getLogger().severe("Economy rollback was not fully successful after a failed shop sale. Amount=" + amount);
+        }
+    }
+
+    private void saveShop(Shop shop) {
+        String p = "shops." + encodedPath(shop.signKey);
+        shopYaml.set(p + ".sign", shop.signKey);
+        shopYaml.set(p + ".container", shop.containerKey);
+        shopYaml.set(p + ".owner", shop.owner == null ? null : shop.owner.toString());
+        shopYaml.set(p + ".ownerName", shop.ownerName);
+        shopYaml.set(p + ".admin", shop.admin);
+        shopYaml.set(p + ".createdByAdmin", shop.createdByAdmin);
+        shopYaml.set(p + ".creator", shop.creator == null ? null : shop.creator.toString());
+        shopYaml.set(p + ".creatorName", shop.creatorName);
+        shopYaml.set(p + ".amount", shop.amount);
+        shopYaml.set(p + ".buy", shop.buy);
+        shopYaml.set(p + ".sell", shop.sell);
+        shopYaml.set(p + ".item", shop.item);
+    }
+
+    private void saveShops() {
+        shopYaml.set("prepared", null);
+        for (Map.Entry<String, PreparedChest> entry : preparedContainers.entrySet()) {
+            String p = "prepared." + encodedPath(entry.getKey());
+            PreparedChest prepared = entry.getValue();
+            shopYaml.set(p + ".container", entry.getKey());
+            shopYaml.set(p + ".admin", prepared.admin);
+            shopYaml.set(p + ".ownerName", prepared.ownerName);
+            shopYaml.set(p + ".creator", prepared.creator == null ? null : prepared.creator.toString());
+            shopYaml.set(p + ".creatorName", prepared.creatorName);
+        }
+        File temp = new File(getDataFolder(), "shops.yml.tmp");
+        try {
+            shopYaml.save(temp);
+            try {
+                Files.move(temp.toPath(), shopFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(temp.toPath(), shopFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            getLogger().severe("Failed to save shops.yml: " + e.getMessage());
+            if (temp.exists()) temp.delete();
+        }
+    }
+
+    private void loadShops() {
+        if (shopYaml.isConfigurationSection("shops")) {
+            for (String child : shopYaml.getConfigurationSection("shops").getKeys(false)) {
+                String p = "shops." + child;
+                try {
+                    String signKey = shopYaml.getString(p + ".sign");
+                    String containerKey = shopYaml.getString(p + ".container");
+                    String ownerString = shopYaml.getString(p + ".owner");
+                    String ownerName = shopYaml.getString(p + ".ownerName");
+                    boolean admin = shopYaml.getBoolean(p + ".admin", false);
+                    boolean createdByAdmin = shopYaml.getBoolean(p + ".createdByAdmin", admin);
+                    String creatorString = shopYaml.getString(p + ".creator");
+                    String creatorName = shopYaml.getString(p + ".creatorName");
+                    int amount = shopYaml.getInt(p + ".amount");
+                    double buy = shopYaml.getDouble(p + ".buy");
+                    double sell = shopYaml.getDouble(p + ".sell");
+                    ItemStack item = shopYaml.getItemStack(p + ".item");
+                    if (item != null && item.getType() == Material.AIR) item = null;
+                    if (signKey == null || containerKey == null) continue;
+                    if (amount <= 0 || amount > MAX_AMOUNT) continue;
+                    if (!Double.isFinite(buy) || !Double.isFinite(sell) || buy < 0.0D || sell < 0.0D || buy > MAX_PRICE || sell > MAX_PRICE || (buy <= 0.0D && sell <= 0.0D)) continue;
+                    UUID owner = ownerString == null || ownerString.isBlank() ? null : UUID.fromString(ownerString);
+                    UUID creator = creatorString == null || creatorString.isBlank() ? null : UUID.fromString(creatorString);
+                    if (!admin && owner == null && (ownerName == null || ownerName.isBlank())) continue;
+                    if (!admin && (ownerName == null || ownerName.isBlank()) && owner != null) {
+                        try { ownerName = Bukkit.getOfflinePlayer(owner).getName(); } catch (Throwable ignored) {}
+                    }
+                    addShop(new Shop(signKey, containerKey, owner, ownerName, admin, createdByAdmin, creator, creatorName, amount, buy, sell, item));
+                } catch (Exception ex) {
+                    getLogger().warning("Skipped invalid shop entry " + child + ": " + ex.getMessage());
+                }
+            }
+        }
+
+        if (shopYaml.isConfigurationSection("prepared")) {
+            for (String child : shopYaml.getConfigurationSection("prepared").getKeys(false)) {
+                String p = "prepared." + child;
+                try {
+                    String containerKey = shopYaml.getString(p + ".container");
+                    boolean admin = shopYaml.getBoolean(p + ".admin", false);
+                    String ownerName = shopYaml.getString(p + ".ownerName");
+                    String creatorString = shopYaml.getString(p + ".creator");
+                    String creatorName = shopYaml.getString(p + ".creatorName");
+                    UUID creator = creatorString == null || creatorString.isBlank() ? null : UUID.fromString(creatorString);
+                    if (containerKey == null || containerKey.isBlank()) continue;
+                    if (!admin && (ownerName == null || ownerName.isBlank())) continue;
+                    preparedContainers.put(containerKey, new PreparedChest(admin, ownerName, creator, creatorName));
+                } catch (Exception ex) {
+                    getLogger().warning("Skipped invalid prepared chest entry " + child + ": " + ex.getMessage());
+                }
+            }
+        }
+    }
+
+    private void saveRatings() {
+        ratingYaml.set("ratings", null);
+        for (Map.Entry<UUID, Map<UUID, Integer>> seller : ratings.entrySet()) {
+            String base = "ratings." + seller.getKey();
+            for (Map.Entry<UUID, Integer> vote : seller.getValue().entrySet()) {
+                ratingYaml.set(base + "." + vote.getKey(), vote.getValue());
+            }
+        }
+        File temp = new File(getDataFolder(), "ratings.yml.tmp");
+        try {
+            ratingYaml.save(temp);
+            try {
+                Files.move(temp.toPath(), ratingFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(temp.toPath(), ratingFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            getLogger().severe("Failed to save ratings.yml: " + e.getMessage());
+            if (temp.exists()) temp.delete();
+        }
+    }
+
+    private void loadRatings() {
+        if (!ratingYaml.isConfigurationSection("ratings")) return;
+        for (String sellerKey : ratingYaml.getConfigurationSection("ratings").getKeys(false)) {
+            try {
+                UUID seller = UUID.fromString(sellerKey);
+                if (!ratingYaml.isConfigurationSection("ratings." + sellerKey)) continue;
+                Map<UUID, Integer> votes = new HashMap<>();
+                for (String raterKey : ratingYaml.getConfigurationSection("ratings." + sellerKey).getKeys(false)) {
+                    try {
+                        UUID rater = UUID.fromString(raterKey);
+                        int score = ratingYaml.getInt("ratings." + sellerKey + "." + raterKey);
+                        if (score >= 1 && score <= 5 && !rater.equals(seller)) votes.put(rater, score);
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (!votes.isEmpty()) ratings.put(seller, votes);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static final class RatingSummary {
+        final double average;
+        final int count;
+        RatingSummary(double average, int count) {
+            this.average = average;
+            this.count = count;
+        }
+        String display() {
+            if (count == 0) return "No ratings yet";
+            return new DecimalFormat("0.00").format(average) + "/5 (" + count + " rating" + (count == 1 ? "" : "s") + ")";
+        }
+    }
+
+    private static final class PricePair {
+        final double buy;
+        final double sell;
+        PricePair(double buy, double sell) {
+            this.buy = buy;
+            this.sell = sell;
+        }
+    }
+
+    private static final class Shop {
+        final String signKey;
+        final String containerKey;
+        final UUID owner;
+        final String ownerName;
+        final boolean admin;
+        final boolean createdByAdmin;
+        final UUID creator;
+        final String creatorName;
+        final int amount;
+        final double buy;
+        final double sell;
+        ItemStack item;
+
+        Shop(String signKey, String containerKey, UUID owner, String ownerName, boolean admin, boolean createdByAdmin,
+             UUID creator, String creatorName, int amount, double buy, double sell, ItemStack item) {
+            this.signKey = signKey;
+            this.containerKey = containerKey;
+            this.owner = owner;
+            this.ownerName = ownerName;
+            this.admin = admin;
+            this.createdByAdmin = createdByAdmin;
+            this.creator = creator;
+            this.creatorName = creatorName;
+            this.amount = amount;
+            this.buy = buy;
+            this.sell = sell;
+            this.item = item == null ? null : item.clone();
+            if (this.item != null) this.item.setAmount(1);
+        }
+    }
+
+    private static final class PreparedChest {
+        final boolean admin;
+        final String ownerName;
+        final UUID creator;
+        final String creatorName;
+
+        PreparedChest(boolean admin, String ownerName, UUID creator, String creatorName) {
+            this.admin = admin;
+            this.ownerName = ownerName;
+            this.creator = creator;
+            this.creatorName = creatorName;
+        }
+
+        boolean isCreator(Player player) {
+            if (creator != null && creator.equals(player.getUniqueId())) return true;
+            return creatorName != null && creatorName.equalsIgnoreCase(player.getName());
+        }
+    }
+
+    private static final class PreparedMatch {
+        final String containerKey;
+        final PreparedChest prepared;
+        PreparedMatch(String containerKey, PreparedChest prepared) {
+            this.containerKey = containerKey;
+            this.prepared = prepared;
+        }
+    }
+
+    private static final class SpecialChestData {
+        final boolean admin;
+        final String ownerName;
+        final UUID creator;
+        final String creatorName;
+        SpecialChestData(boolean admin, String ownerName, UUID creator, String creatorName) {
+            this.admin = admin;
+            this.ownerName = ownerName;
+            this.creator = creator;
+            this.creatorName = creatorName;
+        }
+    }
+
+}
+
+===== plugin.yml =====
+name: LeafChestShop
+version: 1.2.2
+main: dev.leafchestshop.LeafChestShop
+api-version: '1.21'
+softdepend: [Vault, VaultUnlocked]
+description: Secure sign-and-container chest shops for Leaf/Paper 1.21.4 with Vault economy support.
