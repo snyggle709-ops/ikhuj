@@ -1,0 +1,250 @@
+            return;
+        }
+        if (slot == 53 && page < maxPage) {
+            openAdminShopBrowser(player, page + 1);
+            return;
+        }
+        if (slot < 0 || slot >= ADMIN_GUI_PAGE_SIZE) return;
+        int index = page * ADMIN_GUI_PAGE_SIZE + slot;
+        if (index < 0 || index >= adminShops.size()) return;
+        Shop shop = adminShops.get(index);
+
+        if (event.isRightClick()) {
+            if (!canDeleteShop(player, shop)) {
+                msg(player, isToesProtected(shop) ? "§cOnly toes__ can delete this admin chest shop." : "§cYou cannot delete this shop.");
+                return;
+            }
+            deleteShopRecordAndSign(shop);
+            msg(player, "§aAdmin chest shop deleted.");
+            openAdminShopBrowser(player, Math.min(page, Math.max(0, (liveAdminShops().size() - 1) / ADMIN_GUI_PAGE_SIZE)));
+            return;
+        }
+        if (event.isLeftClick()) {
+            teleportAboveShop(player, shop);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
+    public void onAdminGuiDrag(InventoryDragEvent event) {
+        if (!(event.getWhoClicked() instanceof Player player)) return;
+        if (adminGuiPages.containsKey(player.getUniqueId()) && ADMIN_GUI_TITLE.equals(event.getView().getTitle())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onInventoryMove(InventoryMoveItemEvent event) {
+        if (!shopsForInventory(event.getSource()).isEmpty() || !shopsForInventory(event.getDestination()).isEmpty()) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPistonExtend(BlockPistonExtendEvent event) {
+        for (Block block : event.getBlocks()) {
+            if (isProtectedBlock(block)) {
+                event.setCancelled(true);
+                return;
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPistonRetract(BlockPistonRetractEvent event) {
+        for (Block block : event.getBlocks()) {
+            if (isProtectedBlock(block)) {
+                event.setCancelled(true);
+                return;
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onEntityExplode(EntityExplodeEvent event) {
+        event.blockList().removeIf(this::isProtectedBlock);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onBlockExplode(BlockExplodeEvent event) {
+        event.blockList().removeIf(this::isProtectedBlock);
+    }
+
+    private void beginEdit(Player player, Sign sign, Shop shop) {
+        pendingEdits.put(player.getUniqueId(), shop.signKey);
+        renderShopSign(shop);
+        try {
+            player.openSign(sign, Side.FRONT);
+            msg(player, "§eEdit the displayed sign directly. Line 1 = [BUY], [SELL], or [BUY AND SELL]. Line 2 = price. Line 3 = Item xAmount. Use ? as the item name while holding an exact item.");
+        } catch (Throwable t) {
+            pendingEdits.remove(player.getUniqueId());
+            renderShopSign(shop);
+            msg(player, "§cCould not open the sign editor.");
+        }
+    }
+
+    private void showShopInfo(Player player, Shop shop) {
+        String seller = shopSellerName(shop);
+        RatingSummary rating = shop.admin || shop.owner == null ? new RatingSummary(0.0D, 0) : ratingSummary(shop.owner);
+        player.sendMessage("§6§m---------------- §eShop Info §6§m----------------");
+        player.sendMessage("§7Type: §f" + shopType(shop) + (shop.admin ? " §c(Admin / unlimited)" : ""));
+        player.sendMessage("§7Item: §f" + shopItemAmountLine(shop));
+        player.sendMessage("§7Amount per transaction: §f" + shop.amount);
+        player.sendMessage("§7BUY price §8(shop buys from players): §f" + (shop.buy > 0.0D ? "$" + trimDouble(shop.buy) : "Disabled"));
+        player.sendMessage("§7SELL price §8(shop sells to players): §f" + (shop.sell > 0.0D ? "$" + trimDouble(shop.sell) : "Disabled"));
+        player.sendMessage("§7Seller: §f" + seller);
+        if (shop.admin) {
+            player.sendMessage("§7Admin creator: §f" + creatorDisplay(shop));
+            player.sendMessage("§7Seller rating: §eServer shop");
+        } else {
+            player.sendMessage("§7Seller rating: §e" + rating.display());
+        }
+        Container container = getContainer(shop);
+        if (shop.item == null) {
+            player.sendMessage("§7Stock: §eWaiting for item assignment");
+        } else if (shop.admin) {
+            player.sendMessage("§7Stock: §aUnlimited");
+        } else if (container == null) {
+            player.sendMessage("§7Stock: §cContainer missing");
+        } else {
+            int stock = countSimilar(container.getInventory(), shop.item);
+            player.sendMessage("§7Stock: §f" + stock + " item(s) §8(" + (stock / shop.amount) + " transaction(s))");
+        }
+        if (shop.buy > 0.0D && shop.sell > 0.0D) {
+            player.sendMessage("§7Use: §fRight-click = buy from shop; left-click = sell to shop");
+        } else {
+            player.sendMessage("§7Use: §fLeft-click or right-click performs this shop's available transaction");
+        }
+        if (!shop.admin) player.sendMessage("§7Rate seller: §f/rate " + seller + " 1-5 §8| §f/rating " + seller);
+        if (canManage(player, shop)) {
+            player.sendMessage("§7Owner/admin: §fSneak + right-click sign to edit; normal right-click chest to stock.");
+            if (shop.item == null) player.sendMessage("§7Set item: §fHold the item and right-click the sign.");
+        }
+        player.sendMessage("§6§m-------------------------------------------");
+    }
+
+    private void setDisplayLines(SignChangeEvent event, Shop shop) {
+        event.setLine(0, "§6[" + shopType(shop) + "]");
+        event.setLine(1, "§f" + shopPriceLine(shop));
+        event.setLine(2, "§f" + shopItemAmountLine(shop));
+        event.setLine(3, "§7" + shopSellerName(shop));
+    }
+
+    private void renderShopSign(Shop shop) {
+        Location loc = parseLocation(shop.signKey);
+        if (loc == null) return;
+        if (!(loc.getBlock().getState() instanceof Sign sign)) return;
+        sign.setLine(0, "§6[" + shopType(shop) + "]");
+        sign.setLine(1, "§f" + shopPriceLine(shop));
+        sign.setLine(2, "§f" + shopItemAmountLine(shop));
+        sign.setLine(3, "§7" + shopSellerName(shop));
+        sign.update(true, false);
+    }
+
+    private void refreshAllSigns() {
+        for (Shop shop : shops.values()) renderShopSign(shop);
+    }
+
+    private String shopType(Shop shop) {
+        if (shop.buy > 0.0D && shop.sell > 0.0D) return "BUY AND SELL";
+        return shop.buy > 0.0D ? "BUY" : "SELL";
+    }
+
+    private String shopPriceLine(Shop shop) {
+        if (shop.buy > 0.0D && shop.sell > 0.0D) {
+            return "B:$" + trimDouble(shop.buy) + " S:$" + trimDouble(shop.sell);
+        }
+        if (shop.buy > 0.0D) return "BUY PRICE: $" + trimDouble(shop.buy);
+        return "SELL PRICE: $" + trimDouble(shop.sell);
+    }
+
+    private String shopItemAmountLine(Shop shop) {
+        return displayItem(shop.item) + " x" + shop.amount;
+    }
+
+    private String shopSellerName(Shop shop) {
+        if (shop.admin) return "Server";
+        if (shop.ownerName != null && !shop.ownerName.isBlank()) return shop.ownerName;
+        if (shop.owner != null) return sellerName(Bukkit.getOfflinePlayer(shop.owner));
+        return "Unknown";
+    }
+
+    private String sellerName(OfflinePlayer player) {
+        if (player == null) return "Unknown";
+        String name = player.getName();
+        if (name != null && !name.isBlank()) return name;
+        String id = player.getUniqueId().toString();
+        return id.substring(0, Math.min(8, id.length()));
+    }
+
+    private OfflinePlayer findSeller(String name) {
+        for (Shop shop : shops.values()) {
+            if (shop.admin) continue;
+            if (shop.ownerName != null && shop.ownerName.equalsIgnoreCase(name)) {
+                if (shop.owner != null) return Bukkit.getOfflinePlayer(shop.owner);
+                return Bukkit.getOfflinePlayer(shop.ownerName);
+            }
+            if (shop.owner != null) {
+                OfflinePlayer owner = Bukkit.getOfflinePlayer(shop.owner);
+                String known = owner.getName();
+                if (known != null && known.equalsIgnoreCase(name)) return owner;
+            }
+        }
+        Player online = Bukkit.getPlayerExact(name);
+        if (online != null) return online;
+        OfflinePlayer offline = Bukkit.getOfflinePlayer(name);
+        if (offline.getName() == null && !offline.hasPlayedBefore()) return null;
+        return offline;
+    }
+
+    private RatingSummary ratingSummary(UUID seller) {
+        if (seller == null) return new RatingSummary(0.0D, 0);
+        Map<UUID, Integer> votes = ratings.get(seller);
+        if (votes == null || votes.isEmpty()) return new RatingSummary(0.0D, 0);
+        long total = 0L;
+        for (int score : votes.values()) total += score;
+        return new RatingSummary((double) total / votes.size(), votes.size());
+    }
+
+    private Block locationBlock(String locationKey) {
+        Location loc = parseLocation(locationKey);
+        return loc == null ? null : loc.getBlock();
+    }
+
+    private void buy(Player buyer, Shop shop) {
+        if (shop.item == null) {
+            msg(buyer, "§eThis shop does not have an item set yet.");
+            return;
+        }
+        double price = shop.sell;
+        if (price <= 0.0D) {
+            msg(buyer, "§cThis shop is not selling items.");
+            return;
+        }
+        ReentrantLock lock = shopLocks.computeIfAbsent(shop.signKey, k -> new ReentrantLock());
+        if (!lock.tryLock()) {
+            msg(buyer, "§eThat shop is busy. Try again.");
+            return;
+        }
+        try {
+            Container container = getContainer(shop);
+            if (container == null && !shop.admin) {
+                msg(buyer, "§cThe shop container is missing.");
+                return;
+            }
+            if (!resolveEconomy()) {
+                msg(buyer, "§cNo compatible Vault economy provider is available.");
+                return;
+            }
+
+            if (!shop.admin && countSimilar(container.getInventory(), shop.item) < shop.amount) {
+                msg(buyer, "§cOut of stock.");
+                return;
+            }
+            if (!canFit(buyer.getInventory(), shop.item, shop.amount)) {
+                msg(buyer, "§cYou do not have enough inventory space.");
+                return;
+            }
+            OfflinePlayer owner = shop.admin ? null : shopOwnerOffline(shop);
+            if (!shop.admin && isActualOwner(buyer, shop)) {
+                msg(buyer, "§eYou own this shop.");
+                return;
