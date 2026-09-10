@@ -1,0 +1,250 @@
+===== LeafChestShop.java =====
+package dev.leafchestshop;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.World;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockState;
+import org.bukkit.block.Container;
+import org.bukkit.block.DoubleChest;
+import org.bukkit.block.Sign;
+import org.bukkit.block.sign.Side;
+import org.bukkit.block.data.BlockData;
+import org.bukkit.block.data.Directional;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockExplodeEvent;
+import org.bukkit.event.block.BlockPistonExtendEvent;
+import org.bukkit.event.block.BlockPistonRetractEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.SignChangeEvent;
+import org.bukkit.event.entity.EntityExplodeEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.inventory.InventoryMoveItemEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.block.Action;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
+
+public final class LeafChestShop extends JavaPlugin implements Listener {
+    private static final String PREFIX = "§2[LeafChestShop] §r";
+    private static final double MAX_PRICE = 1_000_000_000_000.0D;
+    private static final int MAX_AMOUNT = 64 * 54;
+    private static final String ADMIN_GUI_TITLE = "Admin Chest Shops";
+    private static final int ADMIN_GUI_PAGE_SIZE = 45;
+    private static final String SPECIAL_MARKER = "§0LCS_SPECIAL|";
+
+    private final Map<String, Shop> shops = new HashMap<>();
+    private final Map<String, Set<String>> containerIndex = new HashMap<>();
+    private final Map<String, ReentrantLock> shopLocks = new ConcurrentHashMap<>();
+    private final Map<String, PreparedChest> preparedContainers = new HashMap<>();
+    private final Map<UUID, Integer> adminGuiPages = new HashMap<>();
+    private File shopFile;
+    private YamlConfiguration shopYaml;
+    private File ratingFile;
+    private YamlConfiguration ratingYaml;
+    private final Map<UUID, Map<UUID, Integer>> ratings = new HashMap<>();
+    private final Map<UUID, String> pendingEdits = new HashMap<>();
+    private volatile Object economy;
+    private volatile Class<?> economyClass;
+
+    @Override
+    public void onEnable() {
+        shopFile = new File(getDataFolder(), "shops.yml");
+        if (!getDataFolder().exists()) {
+            getDataFolder().mkdirs();
+        }
+        shopYaml = YamlConfiguration.loadConfiguration(shopFile);
+        ratingFile = new File(getDataFolder(), "ratings.yml");
+        ratingYaml = YamlConfiguration.loadConfiguration(ratingFile);
+        loadShops();
+        loadRatings();
+        getServer().getPluginManager().registerEvents(this, this);
+        getLogger().info("LeafChestShop enabled with " + shops.size() + " shop(s). Economy will be resolved through Vault on demand.");
+    }
+
+    @Override
+    public void onDisable() {
+        saveShops();
+        saveRatings();
+        shops.clear();
+        containerIndex.clear();
+        shopLocks.clear();
+        ratings.clear();
+        pendingEdits.clear();
+        preparedContainers.clear();
+        adminGuiPages.clear();
+        economy = null;
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        String name = command.getName();
+        if (name.equalsIgnoreCase("viewadminchestshops")) {
+            return handleViewAdminShops(sender);
+        }
+        if (name.equalsIgnoreCase("adminchestshop")) {
+            return handleAdminChestShop(sender);
+        }
+        if (name.equalsIgnoreCase("chestshop")) {
+            return handleChestShopCommand(sender, args);
+        }
+        if (name.equalsIgnoreCase("rate")) {
+            return handleRate(sender, args);
+        }
+        if (name.equalsIgnoreCase("rating")) {
+            return handleRating(sender, args);
+        }
+        if (!name.equalsIgnoreCase("leafchestshop") && !name.equalsIgnoreCase("lcs")) {
+            return false;
+        }
+        if (args.length == 0 || args[0].equalsIgnoreCase("help")) {
+            sender.sendMessage(PREFIX + "Create a wall sign attached to a chest, trapped chest, or barrel:");
+            sender.sendMessage("§a[Shop]§r   (or §c[AdminShop]§r with permission)");
+            sender.sendMessage("§f<amount>§r");
+            sender.sendMessage("§fB <shopBuyPrice> S <shopSellPrice>§r  (either side may be omitted)");
+            sender.sendMessage(PREFIX + "B = the shop BUYS from players. S = the shop SELLS to players.");
+            sender.sendMessage("§f<material>§r, §f?§r for held item, or leave line 4 blank and set the item later by right-clicking the sign with it.");
+            sender.sendMessage(PREFIX + "One-way shops accept either left- or right-click. On BUY AND SELL shops: right-click = buy from the shop; left-click = sell to the shop.");
+            sender.sendMessage(PREFIX + "Owners: sneak + right-click the sign to edit; right-click the chest to stock it; sneak + right-click the chest for detailed info.");
+            sender.sendMessage(PREFIX + "Ratings: /rate <seller> <1-5> and /rating <seller>.");
+            if (sender.hasPermission("leafchestshop.admin")) {
+                sender.sendMessage(PREFIX + "Admin: /adminchestshop, /viewadminchestshops, /chestshop create <username>.");
+            }
+            return true;
+        }
+        if (args[0].equalsIgnoreCase("reload")) {
+            if (!sender.hasPermission("leafchestshop.admin")) {
+                sender.sendMessage(PREFIX + "§cNo permission.");
+                return true;
+            }
+            shops.clear();
+            containerIndex.clear();
+            ratings.clear();
+            pendingEdits.clear();
+            preparedContainers.clear();
+            adminGuiPages.clear();
+            shopYaml = YamlConfiguration.loadConfiguration(shopFile);
+            ratingYaml = YamlConfiguration.loadConfiguration(ratingFile);
+            loadShops();
+            loadRatings();
+            economy = null;
+            economyClass = null;
+            sender.sendMessage(PREFIX + "§aReloaded " + shops.size() + " shop(s) and ratings.");
+            return true;
+        }
+        if (args[0].equalsIgnoreCase("purge")) {
+            if (!sender.hasPermission("leafchestshop.admin")) {
+                sender.sendMessage(PREFIX + "§cNo permission.");
+                return true;
+            }
+            int removed = purgeStaleShops();
+            sender.sendMessage(PREFIX + "§aPurged " + removed + " stale shop record(s).");
+            return true;
+        }
+        if (args[0].equalsIgnoreCase("info")) {
+            sender.sendMessage(PREFIX + "Shops: §a" + shops.size() + "§r. Economy: §a" + economyName() + "§r.");
+            return true;
+        }
+        sender.sendMessage(PREFIX + "Use /lcs help, /lcs info, /lcs purge, /lcs reload, /rate, or /rating.");
+        return true;
+    }
+
+    private boolean handleViewAdminShops(CommandSender sender) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can open the admin shop browser.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.admin")) {
+            msg(player, "§cNo permission.");
+            return true;
+        }
+        openAdminShopBrowser(player, 0);
+        return true;
+    }
+
+    private boolean handleAdminChestShop(CommandSender sender) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can receive an admin shop chest.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.admin")) {
+            msg(player, "§cNo permission.");
+            return true;
+        }
+        ItemStack chest = specialChestItem(true, null, player);
+        if (!addSingleItem(player.getInventory(), chest)) {
+            msg(player, "§cYour inventory is full.");
+            return true;
+        }
+        msg(player, "§aAdmin chest shop given. Place it, attach a wall sign, and create the shop normally. Its stock will be unlimited.");
+        return true;
+    }
+
+    private boolean handleChestShopCommand(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can use this command.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.admin")) {
+            msg(player, "§cNo permission.");
+            return true;
+        }
+        if (args.length != 2 || !args[0].equalsIgnoreCase("create")) {
+            msg(player, "§eUsage: /chestshop create <username>");
+            return true;
+        }
+        String targetName = args[1].trim();
+        if (!targetName.matches("[A-Za-z0-9_]{1,16}")) {
+            msg(player, "§cUsername must be 1-16 characters using letters, numbers, or underscore.");
+            return true;
+        }
+        ItemStack chest = specialChestItem(false, targetName, player);
+        if (!addSingleItem(player.getInventory(), chest)) {
+            msg(player, "§cYour inventory is full.");
+            return true;
+        }
+        msg(player, "§aChest given. The next shop created on that chest will belong to §f" + targetName + "§a, even if they have never joined.");
+        return true;
+    }
+
+    private boolean handleRate(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can rate sellers.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.rate")) {
