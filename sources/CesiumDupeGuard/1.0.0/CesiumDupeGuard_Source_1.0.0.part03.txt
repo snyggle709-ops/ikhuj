@@ -1,0 +1,93 @@
+    private Class<?> wrap(Class<?> c) {
+        if (!c.isPrimitive()) return c;
+        if (c == boolean.class) return Boolean.class;
+        if (c == int.class) return Integer.class;
+        if (c == long.class) return Long.class;
+        if (c == float.class) return Float.class;
+        if (c == double.class) return Double.class;
+        if (c == byte.class) return Byte.class;
+        if (c == short.class) return Short.class;
+        if (c == char.class) return Character.class;
+        return c;
+    }
+
+    private ItemStack toggleItem(boolean enabled, String title, List<String> description) {
+        List<String> lore = new ArrayList<>(description);
+        lore.add("");
+        lore.add(enabled ? "§a§lENABLED" : "§c§lDISABLED");
+        return guiItem(enabled ? "LIME_DYE" : "GRAY_DYE", (enabled ? "§a§l" : "§c§l") + title, lore);
+    }
+
+    private ItemStack guiItem(String materialName, String name, List<String> lore) {
+        Material material = Material.matchMaterial(materialName);
+        if (material == null || !material.isItem()) material = Material.PAPER;
+        ItemStack item = new ItemStack(material, 1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName(name);
+            if (lore != null && !lore.isEmpty()) meta.setLore(lore);
+            item.setItemMeta(meta);
+        }
+        return item;
+    }
+
+    private void fill(Inventory inv, ItemStack item) {
+        for (int i = 0; i < inv.getSize(); i++) inv.setItem(i, item == null ? null : item.clone());
+    }
+
+    private void play(Player p, String sound, float volume, float pitch) {
+        try { p.playSound(p.getLocation(), sound, volume, pitch); } catch (Throwable ignored) { }
+    }
+
+    private enum TriState { SAFE, UNSAFE, ABSENT, UNKNOWN }
+
+    private static final class Settings {
+        boolean enforcePaperSafeSettings;
+        boolean fallingBlockPortalBackstop;
+        boolean pistonBackstop;
+        boolean tripwireBackstop;
+        boolean opAlerts;
+        long auditIntervalTicks;
+    }
+
+    private record PaperEditResult(boolean changed, String message) { }
+
+    private static final class PaperState {
+        final boolean fileFound;
+        final TriState piston;
+        final TriState endPortal;
+        final TriState tripwire;
+        final TriState headless;
+        final TriState permanentBreak;
+        final boolean restartRecommended;
+        final boolean pistonUnsafe;
+        final boolean tripwireUnsafe;
+
+        PaperState(boolean fileFound, TriState piston, TriState endPortal, TriState tripwire, TriState headless, TriState permanentBreak, boolean restartRecommended) {
+            this.fileFound = fileFound;
+            this.piston = piston;
+            this.endPortal = endPortal;
+            this.tripwire = tripwire;
+            this.headless = headless;
+            this.permanentBreak = permanentBreak;
+            this.restartRecommended = restartRecommended;
+            this.pistonUnsafe = piston == TriState.UNSAFE;
+            this.tripwireUnsafe = tripwire == TriState.UNSAFE;
+        }
+
+        static PaperState unknown() {
+            return new PaperState(false, TriState.UNKNOWN, TriState.UNKNOWN, TriState.UNKNOWN, TriState.UNKNOWN, TriState.UNKNOWN, false);
+        }
+
+        boolean allSafe() {
+            if (!fileFound) return false;
+            return notUnsafe(piston) && notUnsafe(endPortal) && notUnsafe(tripwire) && notUnsafe(headless) && notUnsafe(permanentBreak);
+        }
+
+        private boolean notUnsafe(TriState s) { return s == TriState.SAFE || s == TriState.ABSENT; }
+    }
+
+    private static final class GuardGui implements InventoryHolder {
+        @Override public Inventory getInventory() { return null; }
+    }
+}
