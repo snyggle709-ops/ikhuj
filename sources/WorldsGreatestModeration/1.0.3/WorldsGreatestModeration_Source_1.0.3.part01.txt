@@ -1,0 +1,250 @@
+                Punishment mute = database.findStrongestActive(playerId, playerName, Set.of("MUTE"), System.currentTimeMillis());
+                if (mute != null) muteCache.put(playerId, mute);
+
+                AltDecision decision = evaluateAlt(playerId, playerName, address.exactHash, address.networkHash, fingerprint, clientTokenHash, false, knownBefore, loginAt, address.scope, forwarded);
+                if (decision != null && decision.shouldAct) {
+                    Punishment applied = applyAltDecision(playerId, playerName, decision);
+                    if (applied != null) {
+                        logAltDecision(playerName, decision, true);
+                        kickByIdSync(playerId, applied.type.equals("BLACKLIST") ? blacklistMessage(applied, true) : banMessage(applied, true));
+                    }
+                } else if (decision != null && decision.score >= 60) {
+                    maybeFlagAltSuspicion(playerId, playerName, decision);
+                    logAltDecision(playerName, decision, false);
+                }
+            } catch (Throwable t) {
+                getLogger().log(Level.WARNING, "Join identity check failed for " + playerName, t);
+            }
+        });
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onChat(AsyncPlayerChatEvent event) {
+        Player player = event.getPlayer();
+        Prompt prompt = prompts.remove(player.getUniqueId());
+        if (prompt != null) {
+            event.setCancelled(true);
+            String input = event.getMessage() == null ? "" : event.getMessage().trim();
+            Bukkit.getScheduler().runTask(this, () -> handlePrompt(player, prompt, input));
+            return;
+        }
+        Punishment mute = muteCache.get(player.getUniqueId());
+        if (mute != null && mute.isActive(System.currentTimeMillis())) {
+            event.setCancelled(true);
+            sync(() -> player.sendMessage(muteMessage(mute)));
+        }
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        UUID id = event.getPlayer().getUniqueId();
+        String playerName = event.getPlayer().getName();
+        uiStates.remove(id);
+        prompts.remove(id);
+        muteCache.remove(id);
+        historyCache.remove(id);
+        warningsCache.remove(id);
+        targetCache.remove(id);
+        preLoginSnapshots.remove(id);
+        if (ready && database != null) {
+            Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+                try { database.endOpenSessions(id, System.currentTimeMillis()); }
+                catch (Throwable t) { getLogger().log(Level.FINE, "Could not close identity session for " + playerName, t); }
+            });
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInventoryClick(InventoryClickEvent event) {
+        HumanEntity human = event.getWhoClicked();
+        if (!(human instanceof Player player)) return;
+        UiState state = uiStates.get(player.getUniqueId());
+        if (state == null) return;
+        String title = event.getView().getTitle();
+        if (title == null || !title.startsWith("§0WGM •")) return;
+        event.setCancelled(true);
+        int slot = event.getRawSlot();
+        if (slot < 0 || slot >= event.getView().getTopInventory().getSize()) return;
+        boolean rightClick = event.isRightClick();
+        // Bukkit/Paper inventory transitions should occur outside the click callback itself.
+        sync(() -> handleUiClick(player, state, slot, rightClick));
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInventoryDrag(InventoryDragEvent event) {
+        HumanEntity human = event.getWhoClicked();
+        if (!(human instanceof Player player)) return;
+        if (uiStates.containsKey(player.getUniqueId()) && event.getView().getTitle().startsWith("§0WGM •")) event.setCancelled(true);
+    }
+
+    private void dispatch(CommandSender sender, String label, String[] args) {
+        if (!ready) {
+            sender.sendMessage(PREFIX + "§cPlugin storage is not ready. Check the console.");
+            return;
+        }
+        if (label.equals("ban-ip") || label.equals("ipban") || label.equals("pardon-ip")) {
+            sender.sendMessage(PREFIX + "§cIP moderation is intentionally disabled. Use account moderation so shared households are not punished together.");
+            return;
+        }
+        if (label.equals("tempban")) label = "ban";
+        if (label.equals("tempmute")) label = "mute";
+        if (label.equals("pardon")) label = "unban";
+
+        if (label.equals("warnings")) {
+            if (args.length == 0) {
+                if (!(sender instanceof Player p)) { sender.sendMessage(PREFIX + "§cConsole must specify a player."); return; }
+                openWarningsAsync(p, p.getName());
+                return;
+            }
+            if (!isModerator(sender)) { noPermission(sender); return; }
+            if (!(sender instanceof Player p)) { sendWarningsText(sender, args[0]); return; }
+            openWarningsAsync(p, args[0]);
+            return;
+        }
+        if (label.equals("moderatorhelp")) {
+            moderatorHelp(sender);
+            return;
+        }
+        if (label.equals("moderate")) {
+            if (!isModerator(sender)) { noPermission(sender); return; }
+            if (!(sender instanceof Player p)) { sender.sendMessage(PREFIX + "§cThe moderation UI requires a player. Commands still work from console."); return; }
+            openMain(p);
+            return;
+        }
+        if (label.equals("config")) {
+            if (!(sender instanceof Player p) || !p.isOp()) { sender.sendMessage(PREFIX + "§c/config is OP-only."); return; }
+            openConfig(p);
+            return;
+        }
+        if (label.equals("viewmodhistory")) {
+            if (!isModerator(sender)) { noPermission(sender); return; }
+            if (args.length < 1) { sender.sendMessage(PREFIX + "§cUsage: /viewmodhistory <username>"); return; }
+            if (sender instanceof Player p) openHistoryAsync(p, args[0]); else sendHistoryText(sender, args[0]);
+            return;
+        }
+
+        if (!isModerator(sender)) { noPermission(sender); return; }
+        switch (label) {
+            case "ban" -> commandTimed(sender, "BAN", args, "/ban <user> <10s/10m/1h/1d/1w/1mo/1y/forever> [reason]");
+            case "mute" -> commandTimed(sender, "MUTE", args, "/mute <user> <duration> [reason]");
+            case "kick" -> commandSimple(sender, "KICK", args, "/kick <user> [reason]");
+            case "blacklist" -> commandTimed(sender, "BLACKLIST", args, "/blacklist <user> <duration> [reason]");
+            case "warn" -> commandTimed(sender, "WARN", args, "/warn <user> <duration> [reason]");
+            case "unban" -> commandRevoke(sender, "BAN", args, "/unban <user> [reason]");
+            case "unmute" -> commandRevoke(sender, "MUTE", args, "/unmute <user> [reason]");
+            case "unblacklist" -> commandRevoke(sender, "BLACKLIST", args, "/unblacklist <user> [reason]");
+            case "unwarn" -> commandUnwarn(sender, args);
+            default -> moderatorHelp(sender);
+        }
+    }
+
+    private void commandTimed(CommandSender sender, String type, String[] args, String usage) {
+        if (args.length < 2) { sender.sendMessage(PREFIX + "§cUsage: " + usage); return; }
+        long duration = parseDuration(args[1]);
+        if (duration == Long.MIN_VALUE || duration == 0) { sender.sendMessage(PREFIX + "§cInvalid duration. Use s/m/h/d/w/mo/y or forever."); return; }
+        String reason = join(args, 2);
+        if (!reasonAllowed(sender, reason)) return;
+        submitPunishment(sender, type, normalizeTarget(args[0]), duration, normalizeReason(reason));
+    }
+
+    private void commandSimple(CommandSender sender, String type, String[] args, String usage) {
+        if (args.length < 1) { sender.sendMessage(PREFIX + "§cUsage: " + usage); return; }
+        String reason = join(args, 1);
+        if (!reasonAllowed(sender, reason)) return;
+        submitPunishment(sender, type, normalizeTarget(args[0]), 0L, normalizeReason(reason));
+    }
+
+    private void commandRevoke(CommandSender sender, String type, String[] args, String usage) {
+        if (args.length < 1) { sender.sendMessage(PREFIX + "§cUsage: " + usage); return; }
+        String target = normalizeTarget(args[0]);
+        String reason = normalizeReason(join(args, 1));
+        UUID targetUuid = knownUuid(target);
+        String modName = senderName(sender);
+        String modDisplay = moderatorDisplay(sender);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                int changed = database.deactivate(type, targetUuid, target);
+                if (type.equals("BAN")) changed += database.deactivateInheritedBans(targetUuid, target);
+                final int count = changed;
+                database.insertAudit("UN" + type, targetUuid, target, modName, modDisplay, reason);
+                sync(() -> sender.sendMessage(PREFIX + (count > 0 ? "§aRemoved " + type.toLowerCase(Locale.ROOT) + " from §f" + target + "§a." : "§eNo active " + type.toLowerCase(Locale.ROOT) + " found for §f" + target + "§e.")));
+            } catch (Throwable t) { asyncError(sender, t); }
+        });
+    }
+
+    private void commandUnwarn(CommandSender sender, String[] args) {
+        if (args.length < 2) { sender.sendMessage(PREFIX + "§cUsage: /unwarn <user> <warning-id|all>"); return; }
+        String target = normalizeTarget(args[0]);
+        String id = args[1];
+        UUID targetUuid = knownUuid(target);
+        String modName = senderName(sender);
+        String modDisplay = moderatorDisplay(sender);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                int changed = id.equalsIgnoreCase("all") ? database.deactivate("WARN", targetUuid, target) : database.deactivateWarning(targetUuid, target, id);
+                if (changed > 0) database.insertAudit("UNWARN", targetUuid, target, modName, modDisplay, "Removed warning " + id);
+                sync(() -> sender.sendMessage(PREFIX + (changed > 0 ? "§aWarning removed." : "§eNo matching active warning found.")));
+            } catch (Throwable t) { asyncError(sender, t); }
+        });
+    }
+
+    private void submitPunishment(CommandSender sender, String type, String target, long duration, String reason) {
+        String moderatorName = senderName(sender);
+        String moderatorDisplay = moderatorDisplay(sender);
+        UUID modUuid = sender instanceof Player p ? p.getUniqueId() : null;
+        UUID targetUuid = knownUuid(target);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                long now = System.currentTimeMillis();
+                long expires;
+                if (type.equals("KICK")) expires = now;
+                else expires = duration < 0 ? 0L : duration == 0 ? now : safeAdd(now, duration);
+                boolean active = !type.equals("KICK");
+                Punishment p = new Punishment(UUID.randomUUID().toString(), type, targetUuid, target, modUuid, moderatorName, moderatorDisplay, reason, now, expires, active, null);
+                database.insertPunishment(p);
+                if (type.equals("KICK") || type.equals("WARN")) {
+                    String eventId = database.insertEvent("NETWORK_" + type, p.id);
+                    seenEventIds.add(eventId);
+                    seenEventTimes.put(eventId, now);
+                }
+                applyImmediate(p);
+                sync(() -> sender.sendMessage(PREFIX + "§a" + prettyType(type) + " applied to §f" + target + "§a" + (duration > 0 ? " for §f" + formatDuration(duration) : (duration < 0 && Set.of("BAN", "MUTE", "BLACKLIST", "WARN").contains(type)) ? " permanently" : "") + "."));
+            } catch (Throwable t) { asyncError(sender, t); }
+        });
+    }
+
+    private void applyImmediate(Punishment p) {
+        sync(() -> {
+            Player target = Bukkit.getPlayerExact(p.targetName);
+            if (target == null && p.targetUuid != null) target = Bukkit.getPlayer(p.targetUuid);
+            if (p.type.equals("BAN") || p.type.equals("BLACKLIST")) {
+                if (target != null) kickRich(target, p.type.equals("BAN") ? banMessage(p, false) : blacklistMessage(p, false));
+            } else if (p.type.equals("KICK")) {
+                if (target != null) kickRich(target, kickMessage(p));
+            } else if (p.type.equals("MUTE")) {
+                if (target != null) muteCache.put(target.getUniqueId(), p);
+            } else if (p.type.equals("WARN")) {
+                if (target != null) {
+                    target.sendMessage("§e⚠ You were warned by a moderator. Type §f/warnings §eto view your warnings.");
+                }
+            }
+        });
+    }
+
+    private void networkTick() {
+        if (!ready) return;
+        List<OnlineRef> online = new ArrayList<>();
+        for (Player p : Bukkit.getOnlinePlayers()) online.add(new OnlineRef(p.getUniqueId(), p.getName()));
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> networkTickAsync(online));
+    }
+
+    private void networkTickAsync(List<OnlineRef> online) {
+        try {
+            long now = System.currentTimeMillis();
+            preLoginSnapshots.entrySet().removeIf(e -> now - e.getValue().loginAt > 120_000L);
+            if (now - lastSettingsRefresh > 10_000L) {
+                settings = Settings.load(database);
+                lastSettingsRefresh = now;
+            }
+            if (now - lastCleanup > 60_000L) {
+                database.cleanupExpired(now);
