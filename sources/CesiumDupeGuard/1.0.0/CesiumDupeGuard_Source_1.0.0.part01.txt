@@ -1,0 +1,180 @@
+        Inventory top = event.getView().getTopInventory();
+        if (!(top.getHolder() instanceof GuardGui)) return;
+        event.setCancelled(true);
+        if (!player.isOp()) {
+            player.closeInventory();
+            return;
+        }
+        int slot = event.getRawSlot();
+        if (slot < 0 || slot >= top.getSize()) return;
+        play(player, "ui.button.click", 0.45f, 1.25f);
+        handleGuiClick(player, slot);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onGuiDrag(InventoryDragEvent event) {
+        if (event.getView().getTopInventory().getHolder() instanceof GuardGui) event.setCancelled(true);
+    }
+
+    private void handleGuiClick(Player player, int slot) {
+        switch (slot) {
+            case 10 -> {
+                settings.enforcePaperSafeSettings = !settings.enforcePaperSafeSettings;
+                saveSettings();
+                if (settings.enforcePaperSafeSettings) applySafePaperSettings(true);
+                openGuiLater(player);
+            }
+            case 12 -> {
+                settings.fallingBlockPortalBackstop = !settings.fallingBlockPortalBackstop;
+                saveSettings();
+                openGuiLater(player);
+            }
+            case 14 -> {
+                settings.pistonBackstop = !settings.pistonBackstop;
+                saveSettings();
+                openGuiLater(player);
+            }
+            case 16 -> {
+                settings.tripwireBackstop = !settings.tripwireBackstop;
+                saveSettings();
+                openGuiLater(player);
+            }
+            case 20 -> {
+                settings.opAlerts = !settings.opAlerts;
+                saveSettings();
+                openGuiLater(player);
+            }
+            case 22 -> {
+                PaperEditResult result = applySafePaperSettings(true);
+                player.sendMessage(PREFIX + result.message);
+                play(player, result.changed ? "entity.player.levelup" : "block.note_block.pling", 0.8f, result.changed ? 1.2f : 1.0f);
+                openGuiLater(player);
+            }
+            case 24 -> {
+                auditPaperSettings();
+                player.sendMessage(PREFIX + "§aPaper/Leaf dupe-safety settings rechecked.");
+                openGuiLater(player);
+            }
+            case 26 -> player.closeInventory();
+            default -> { }
+        }
+    }
+
+    private void openGui(Player player) {
+        auditPaperSettings();
+        Inventory inv = Bukkit.createInventory(new GuardGui(), 27, GUI_TITLE);
+        fill(inv, guiItem("GRAY_STAINED_GLASS_PANE", "§8", List.of()));
+
+        inv.setItem(4, guiItem(paperState.allSafe() ? "EMERALD" : "REDSTONE", paperState.allSafe() ? "§a§lPaper/Leaf Native Fixes: SAFE" : "§c§lPaper/Leaf Native Fixes: ATTENTION", paperStateLore()));
+        inv.setItem(10, toggleItem(settings.enforcePaperSafeSettings, "Enforce Paper Safe Settings", List.of(
+                "§7Keeps documented Paper duplication",
+                "§7exploit switches set to their safe values.",
+                "§8This edits only known boolean keys.",
+                "",
+                "§eClick to toggle"
+        )));
+        inv.setItem(12, toggleItem(settings.fallingBlockPortalBackstop, "End-Portal Falling-Block Backstop", List.of(
+                "§7Cancels falling-block transitions into",
+                "§7The End as a second layer against",
+                "§7gravity-block portal duplication.",
+                "",
+                "§8No player is accused or punished.",
+                "§eClick to toggle"
+        )));
+        inv.setItem(14, toggleItem(settings.pistonBackstop, "Piston Dupe Backstop", List.of(
+                "§7Normally does nothing because Paper",
+                "§7already fixes piston duplication.",
+                "§7If that unsafe Paper switch is ON,",
+                "§7blocks piston movement of TNT/rails/carpets.",
+                "",
+                "§eClick to toggle"
+        )));
+        inv.setItem(16, toggleItem(settings.tripwireBackstop, "Tripwire Backstop", List.of(
+                "§7Normally does nothing.",
+                "§7If Paper's tripwire validation is disabled,",
+                "§7tripwire-hook placement is blocked until fixed.",
+                "",
+                "§eClick to toggle"
+        )));
+        inv.setItem(20, toggleItem(settings.opAlerts, "Operator Alerts", List.of(
+                "§7Notify online operators only when",
+                "§7a deterministic backstop actually blocks",
+                "§7an exploit-prone server mechanic.",
+                "",
+                "§eClick to toggle"
+        )));
+        inv.setItem(22, guiItem("ANVIL", "§a§lApply Safe Paper Settings", List.of(
+                "§7Writes documented safe values into",
+                "§fconfig/paper-global.yml§7.",
+                "§7A timestamped backup is made first.",
+                "",
+                "§cA full server restart is required",
+                "§cfor Paper configuration changes.",
+                "",
+                "§eClick to apply"
+        )));
+        inv.setItem(24, guiItem("SPYGLASS", "§b§lRecheck Configuration", List.of(
+                "§7Read the current Paper/Leaf settings again.",
+                "",
+                "§eClick to recheck"
+        )));
+        inv.setItem(26, guiItem("BARRIER", "§cClose", List.of()));
+
+        inv.setItem(18, guiItem("BOOK", "§f§lProtection Statistics", List.of(
+                "§7Piston exploit mechanics blocked: §f" + pistonBlocks.get(),
+                "§7Falling-block portal moves blocked: §f" + portalBlocks.get(),
+                "§7Unsafe tripwire placements blocked: §f" + tripwireBlocks.get(),
+                "§7Safe-setting apply runs: §f" + hardenRuns.get(),
+                "",
+                "§8DupeGuard never bans, blacklists,",
+                "§8or deletes inventory items based on",
+                "§8timing/count/fingerprint guesses."
+        )));
+
+        player.openInventory(inv);
+        play(player, "block.chest.open", 0.65f, 1.1f);
+    }
+
+    private void openGuiLater(Player player) {
+        getServer().getScheduler().runTaskLater(this, () -> {
+            if (player.isOnline() && player.isOp()) openGui(player);
+        }, 1L);
+    }
+
+    private List<String> paperStateLore() {
+        List<String> lore = new ArrayList<>();
+        lore.add(stateLine("Piston duplication", paperState.piston));
+        lore.add(stateLine("Unsafe End-portal teleportation", paperState.endPortal));
+        lore.add(stateLine("Tripwire validation bypass", paperState.tripwire));
+        lore.add(stateLine("Headless pistons", paperState.headless));
+        lore.add(stateLine("Permanent-block exploits", paperState.permanentBreak));
+        lore.add("");
+        if (!paperState.fileFound) lore.add("§cCould not locate config/paper-global.yml.");
+        else if (paperState.restartRecommended) lore.add("§eFile was hardened; restart server to apply.");
+        else lore.add(paperState.allSafe() ? "§aDocumented native dupe switches are safe." : "§cOne or more unsafe switches are enabled.");
+        return lore;
+    }
+
+    private String stateLine(String label, TriState value) {
+        return switch (value) {
+            case SAFE -> "§a✔ §7" + label + ": §aSAFE";
+            case UNSAFE -> "§c✘ §7" + label + ": §cUNSAFE";
+            case ABSENT -> "§8• §7" + label + ": §8not present";
+            case UNKNOWN -> "§e? §7" + label + ": §eunknown";
+        };
+    }
+
+    private void loadSettings() {
+        settingsYaml = YamlConfiguration.loadConfiguration(settingsFile);
+        settings = new Settings();
+        settings.enforcePaperSafeSettings = settingsYaml.getBoolean("enforce-paper-safe-settings", true);
+        settings.fallingBlockPortalBackstop = settingsYaml.getBoolean("backstops.falling-block-end-portal", true);
+        settings.pistonBackstop = settingsYaml.getBoolean("backstops.piston-dupe-materials-if-native-unsafe", true);
+        settings.tripwireBackstop = settingsYaml.getBoolean("backstops.tripwire-if-native-unsafe", true);
+        settings.opAlerts = settingsYaml.getBoolean("operator-alerts", true);
+        settings.auditIntervalTicks = Math.max(200L, settingsYaml.getLong("audit-interval-ticks", 1200L));
+        saveSettings();
+    }
+
+    private void saveSettings() {
+        if (settingsYaml == null || settings == null) return;
