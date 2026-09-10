@@ -1,0 +1,250 @@
+            InventoryHolder right = doubleChest.getRightSide();
+            if (left instanceof Container c) locationKeys.add(key(c.getLocation()));
+            if (right instanceof Container c) locationKeys.add(key(c.getLocation()));
+        }
+        if (locationKeys.isEmpty()) return List.of();
+        List<Shop> result = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (String locationKey : locationKeys) {
+            Set<String> signKeys = containerIndex.get(locationKey);
+            if (signKeys == null) continue;
+            for (String signKey : signKeys) {
+                if (!seen.add(signKey)) continue;
+                Shop shop = shops.get(signKey);
+                if (shop != null) result.add(shop);
+            }
+        }
+        return result;
+    }
+
+    private static int countSimilar(Inventory inventory, ItemStack template) {
+        int count = 0;
+        for (ItemStack stack : inventory.getStorageContents()) {
+            if (stack != null && stack.getAmount() > 0 && stack.isSimilar(template)) {
+                count += stack.getAmount();
+            }
+        }
+        return count;
+    }
+
+    private static boolean removeExact(Inventory inventory, ItemStack template, int amount) {
+        if (countSimilar(inventory, template) < amount) return false;
+        int remaining = amount;
+        ItemStack[] contents = inventory.getStorageContents();
+        for (int i = 0; i < contents.length && remaining > 0; i++) {
+            ItemStack stack = contents[i];
+            if (stack == null || !stack.isSimilar(template)) continue;
+            int take = Math.min(remaining, stack.getAmount());
+            int newAmount = stack.getAmount() - take;
+            if (newAmount <= 0) {
+                inventory.setItem(i, null);
+            } else {
+                stack.setAmount(newAmount);
+                inventory.setItem(i, stack);
+            }
+            remaining -= take;
+        }
+        return remaining == 0;
+    }
+
+    private static boolean canFit(Inventory inventory, ItemStack template, int amount) {
+        int remaining = amount;
+        int max = Math.min(template.getMaxStackSize(), inventory.getMaxStackSize());
+        for (ItemStack stack : inventory.getStorageContents()) {
+            if (stack == null || stack.getType() == Material.AIR) {
+                remaining -= max;
+            } else if (stack.isSimilar(template)) {
+                remaining -= Math.max(0, Math.min(max, stack.getMaxStackSize()) - stack.getAmount());
+            }
+            if (remaining <= 0) return true;
+        }
+        return false;
+    }
+
+    private static boolean addExact(Inventory inventory, ItemStack template, int amount) {
+        if (!canFit(inventory, template, amount)) return false;
+        int remaining = amount;
+        int inventoryMax = inventory.getMaxStackSize();
+        ItemStack[] contents = inventory.getStorageContents();
+
+        for (int i = 0; i < contents.length && remaining > 0; i++) {
+            ItemStack stack = contents[i];
+            if (stack == null || !stack.isSimilar(template)) continue;
+            int max = Math.min(inventoryMax, stack.getMaxStackSize());
+            int room = Math.max(0, max - stack.getAmount());
+            if (room == 0) continue;
+            int add = Math.min(room, remaining);
+            ItemStack updated = stack.clone();
+            updated.setAmount(stack.getAmount() + add);
+            inventory.setItem(i, updated);
+            remaining -= add;
+        }
+
+        int max = Math.min(inventoryMax, template.getMaxStackSize());
+        for (int i = 0; i < contents.length && remaining > 0; i++) {
+            ItemStack current = contents[i];
+            if (current != null && current.getType() != Material.AIR) continue;
+            int add = Math.min(max, remaining);
+            ItemStack placed = template.clone();
+            placed.setAmount(add);
+            inventory.setItem(i, placed);
+            remaining -= add;
+        }
+        return remaining == 0;
+    }
+
+    private PricePair parsePrices(String line) {
+        if (line == null || line.isBlank()) return null;
+        String normalized = line.toUpperCase(Locale.ROOT).replace("$", " ").replace(":", " ").replace("|", " ");
+        String[] parts = normalized.trim().split("\\s+");
+        double buy = 0.0D;
+        double sell = 0.0D;
+        try {
+            for (int i = 0; i < parts.length; i++) {
+                if ((parts[i].equals("B") || parts[i].equals("BUY")) && i + 1 < parts.length) {
+                    buy = parsePrice(parts[++i]);
+                } else if ((parts[i].equals("S") || parts[i].equals("SELL")) && i + 1 < parts.length) {
+                    sell = parsePrice(parts[++i]);
+                }
+            }
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+        return new PricePair(buy, sell);
+    }
+
+    private double parsePrice(String raw) {
+        double value = Double.parseDouble(raw.replace(",", ""));
+        if (!Double.isFinite(value) || value < 0.0D || value > MAX_PRICE) throw new NumberFormatException("price");
+        return value;
+    }
+
+    private static String priceDisplay(PricePair pair) {
+        StringBuilder out = new StringBuilder();
+        if (pair.buy > 0) out.append("B ").append(trimDouble(pair.buy));
+        if (pair.sell > 0) {
+            if (!out.isEmpty()) out.append(" S ");
+            else out.append("S ");
+            out.append(trimDouble(pair.sell));
+        }
+        return out.toString();
+    }
+
+    private static String trimDouble(double d) {
+        if (d == Math.rint(d)) return Long.toString((long) d);
+        return java.math.BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
+    }
+
+    private static String displayItem(ItemStack item) {
+        if (item == null) return "No Item Set";
+        try {
+            ItemMeta meta = item.getItemMeta();
+            if (meta != null && meta.hasDisplayName()) {
+                String name = meta.getDisplayName();
+                if (name != null && !name.isBlank()) return stripColor(name);
+            }
+        } catch (Throwable ignored) {
+        }
+        String raw = item.getType().name().toLowerCase(Locale.ROOT).replace('_', ' ');
+        StringBuilder b = new StringBuilder(raw.length());
+        boolean upper = true;
+        for (char c : raw.toCharArray()) {
+            if (upper && Character.isLetter(c)) {
+                b.append(Character.toUpperCase(c));
+                upper = false;
+            } else {
+                b.append(c);
+                if (c == ' ') upper = true;
+            }
+        }
+        String result = b.toString();
+        return result.length() > 32 ? result.substring(0, 32) : result;
+    }
+
+    private static String stripColor(String s) {
+        return s.replaceAll("(?i)§[0-9A-FK-ORX]", "");
+    }
+
+    private static String clean(String value) {
+        return value == null ? "" : stripColor(value).trim();
+    }
+
+    private void msg(Player player, String text) {
+        player.sendMessage(PREFIX + text);
+    }
+
+    private static String key(Location loc) {
+        World w = loc.getWorld();
+        if (w == null) return "unknown:0:0:0";
+        return w.getUID() + ":" + loc.getBlockX() + ":" + loc.getBlockY() + ":" + loc.getBlockZ();
+    }
+
+    private Location parseLocation(String key) {
+        try {
+            String[] p = key.split(":", 4);
+            UUID worldId = UUID.fromString(p[0]);
+            World world = Bukkit.getWorld(worldId);
+            if (world == null) return null;
+            return new Location(world, Integer.parseInt(p[1]), Integer.parseInt(p[2]), Integer.parseInt(p[3]));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String encodedPath(String raw) {
+        return raw.replace("-", "_").replace(":", "__");
+    }
+
+    private int purgeStaleShops() {
+        List<Shop> stale = new ArrayList<>();
+        for (Shop shop : new ArrayList<>(shops.values())) {
+            Location signLoc = parseLocation(shop.signKey);
+            Location containerLoc = parseLocation(shop.containerKey);
+            if (signLoc == null || containerLoc == null) continue; // world may simply be unloaded
+            if (!(signLoc.getBlock().getState() instanceof Sign) || !(containerLoc.getBlock().getState() instanceof Container)) {
+                stale.add(shop);
+            }
+        }
+        for (Shop shop : stale) {
+            removeShop(shop);
+            shopYaml.set("shops." + encodedPath(shop.signKey), null);
+        }
+        if (!stale.isEmpty()) saveShops();
+        return stale.size();
+    }
+
+    private void addShop(Shop shop) {
+        shops.put(shop.signKey, shop);
+        containerIndex.computeIfAbsent(shop.containerKey, k -> new HashSet<>()).add(shop.signKey);
+    }
+
+    private void removeShop(Shop shop) {
+        shops.remove(shop.signKey);
+        Set<String> set = containerIndex.get(shop.containerKey);
+        if (set != null) {
+            set.remove(shop.signKey);
+            if (set.isEmpty()) containerIndex.remove(shop.containerKey);
+        }
+        shopLocks.remove(shop.signKey);
+    }
+
+    private static ItemStack[] cloneContents(ItemStack[] source) {
+        ItemStack[] copy = new ItemStack[source.length];
+        for (int i = 0; i < source.length; i++) {
+            copy[i] = source[i] == null ? null : source[i].clone();
+        }
+        return copy;
+    }
+
+    private static void restoreContents(Inventory inventory, ItemStack[] snapshot) {
+        inventory.setStorageContents(cloneContents(snapshot));
+    }
+
+    private void reverseTransfer(OfflinePlayer credited, OfflinePlayer debited, double amount, boolean hadCredit) {
+        boolean debitReversed = !hadCredit || withdraw(credited, amount);
+        boolean payerRefunded = deposit(debited, amount);
+        if (!debitReversed || !payerRefunded) {
+            getLogger().severe("Economy rollback was not fully successful after a failed shop purchase. Amount=" + amount);
+        }
+    }
+
