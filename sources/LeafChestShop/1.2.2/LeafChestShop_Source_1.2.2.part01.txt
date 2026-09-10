@@ -1,0 +1,250 @@
+            msg(player, "§cYou do not have permission to rate sellers.");
+            return true;
+        }
+        if (args.length != 2) {
+            msg(player, "§eUsage: /rate <seller> <1-5>");
+            return true;
+        }
+        int score;
+        try {
+            score = Integer.parseInt(args[1]);
+        } catch (NumberFormatException ex) {
+            msg(player, "§cRating must be a whole number from 1 to 5.");
+            return true;
+        }
+        if (score < 1 || score > 5) {
+            msg(player, "§cRating must be from 1 to 5.");
+            return true;
+        }
+        OfflinePlayer target = findSeller(args[0]);
+        if (target == null) {
+            msg(player, "§cSeller not found. Use the seller name shown on a shop.");
+            return true;
+        }
+        if (args[0].equalsIgnoreCase(player.getName()) || target.getUniqueId().equals(player.getUniqueId())) {
+            msg(player, "§cYou cannot rate yourself.");
+            return true;
+        }
+        ratings.computeIfAbsent(target.getUniqueId(), k -> new HashMap<>()).put(player.getUniqueId(), score);
+        saveRatings();
+        RatingSummary summary = ratingSummary(target.getUniqueId());
+        msg(player, "§aRated §f" + sellerName(target) + " §a" + score + "/5. Overall: §f" + summary.display() + "§a.");
+        return true;
+    }
+
+    private boolean handleRating(CommandSender sender, String[] args) {
+        if (args.length != 1) {
+            sender.sendMessage(PREFIX + "§eUsage: /rating <seller>");
+            return true;
+        }
+        OfflinePlayer target = findSeller(args[0]);
+        if (target == null) {
+            sender.sendMessage(PREFIX + "§cSeller not found. Use the seller name shown on a shop.");
+            return true;
+        }
+        RatingSummary summary = ratingSummary(target.getUniqueId());
+        sender.sendMessage(PREFIX + "§f" + sellerName(target) + "§r rating: §e" + summary.display() + "§r.");
+        return true;
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onSignChange(SignChangeEvent event) {
+        String signKey = key(event.getBlock().getLocation());
+        Shop existing = shops.get(signKey);
+        Player player = event.getPlayer();
+        boolean editing = existing != null && signKey.equals(pendingEdits.remove(player.getUniqueId()));
+
+        if (existing != null && !editing) {
+            event.setCancelled(true);
+            msg(player, "§cThis shop sign is protected. Owners can sneak + right-click it to edit.");
+            return;
+        }
+
+        if (editing) {
+            handleFriendlyShopEdit(event, player, existing);
+            return;
+        }
+
+        String header = clean(event.getLine(0));
+        if (!header.equalsIgnoreCase("[shop]") && !header.equalsIgnoreCase("[adminshop]")) {
+            return;
+        }
+        if (!player.hasPermission("leafchestshop.create")) {
+            event.setCancelled(true);
+            msg(player, "§cYou do not have permission to create shops.");
+            return;
+        }
+
+        Block signBlock = event.getBlock();
+        Block containerBlock = attachedContainer(signBlock);
+        if (containerBlock == null || !(containerBlock.getState() instanceof Container containerState) || !isAllowedShopContainer(containerBlock)) {
+            event.setCancelled(true);
+            msg(player, "§cThe sign must be attached to a chest, trapped chest, or barrel.");
+            return;
+        }
+        if (!shopsForInventory(containerState.getInventory()).isEmpty()) {
+            event.setCancelled(true);
+            msg(player, "§cThat container already has a shop attached.");
+            return;
+        }
+
+        PreparedMatch preparedMatch = findPrepared(containerState);
+        PreparedChest prepared = preparedMatch == null ? null : preparedMatch.prepared;
+        boolean admin = prepared != null ? prepared.admin : header.equalsIgnoreCase("[adminshop]");
+        if (admin && !player.hasPermission("leafchestshop.admin")) {
+            event.setCancelled(true);
+            msg(player, "§cYou do not have permission to create admin shops.");
+            return;
+        }
+        if (prepared != null && !player.hasPermission("leafchestshop.admin")) {
+            event.setCancelled(true);
+            msg(player, "§cOnly an admin can finish a special chest shop.");
+            return;
+        }
+
+        int amount;
+        try {
+            amount = Integer.parseInt(clean(event.getLine(1)));
+        } catch (Exception ex) {
+            event.setCancelled(true);
+            msg(player, "§cInvalid amount. Example: 16");
+            return;
+        }
+        if (amount <= 0 || amount > MAX_AMOUNT) {
+            event.setCancelled(true);
+            msg(player, "§cAmount must be between 1 and " + MAX_AMOUNT + ".");
+            return;
+        }
+
+        PricePair prices = parsePrices(clean(event.getLine(2)));
+        if (prices == null || (prices.buy <= 0.0D && prices.sell <= 0.0D)) {
+            event.setCancelled(true);
+            msg(player, "§cInvalid price. B = shop BUYS from players; S = shop SELLS to players. Example: B 50 S 100");
+            return;
+        }
+
+        ItemStack template = null;
+        String itemLine = clean(event.getLine(3));
+        if (itemLine.equals("?")) {
+            ItemStack hand = player.getInventory().getItemInMainHand();
+            if (hand == null || hand.getType() == Material.AIR) {
+                event.setCancelled(true);
+                msg(player, "§cHold the exact item you want when using ?");
+                return;
+            }
+            template = hand.clone();
+            template.setAmount(1);
+        } else if (!itemLine.isBlank()) {
+            Material material = Material.matchMaterial(itemLine.replace(' ', '_'));
+            if (material == null || material == Material.AIR || !material.isItem()) {
+                event.setCancelled(true);
+                msg(player, "§cUnknown item: " + itemLine + ". Leave line 4 blank for no item, or use ? for your held item.");
+                return;
+            }
+            template = new ItemStack(material, 1);
+        }
+
+        UUID owner;
+        String ownerName;
+        UUID creator;
+        String creatorName;
+        if (prepared != null && !prepared.admin) {
+            ownerName = prepared.ownerName;
+            owner = resolveOfflineUuid(ownerName);
+            creator = prepared.creator;
+            creatorName = prepared.creatorName;
+        } else if (admin) {
+            owner = null;
+            ownerName = null;
+            creator = prepared != null ? prepared.creator : player.getUniqueId();
+            creatorName = prepared != null ? prepared.creatorName : player.getName();
+        } else {
+            owner = player.getUniqueId();
+            ownerName = player.getName();
+            creator = player.getUniqueId();
+            creatorName = player.getName();
+        }
+
+        boolean createdByAdmin = prepared != null || admin || player.hasPermission("leafchestshop.admin");
+        Shop shop = new Shop(signKey, key(containerBlock.getLocation()), owner, ownerName, admin, createdByAdmin, creator, creatorName, amount, prices.buy, prices.sell, template);
+        addShop(shop);
+        if (preparedMatch != null) preparedContainers.remove(preparedMatch.containerKey);
+        saveShop(shop);
+        saveShops();
+
+        setDisplayLines(event, shop);
+        if (template == null) {
+            msg(player, "§aShop created. §eNo item is set yet. The shop owner can right-click the sign while holding the item to assign it.");
+        } else {
+            msg(player, "§aShop created. §fRight-click = buy from the shop; left-click = sell to the shop.");
+        }
+    }
+
+    private void handleFriendlyShopEdit(SignChangeEvent event, Player player, Shop existing) {
+        if (!canManage(player, existing)) {
+            event.setCancelled(true);
+            renderShopSign(existing);
+            msg(player, "§cYou cannot edit this shop.");
+            return;
+        }
+        if (!player.hasPermission("leafchestshop.create")) {
+            event.setCancelled(true);
+            renderShopSign(existing);
+            msg(player, "§cYou do not have permission to edit shops.");
+            return;
+        }
+        if (existing.admin && !player.hasPermission("leafchestshop.admin")) {
+            event.setCancelled(true);
+            renderShopSign(existing);
+            msg(player, "§cYou do not have permission to edit admin shops.");
+            return;
+        }
+
+        Block containerBlock = locationBlock(existing.containerKey);
+        if (containerBlock == null || !(containerBlock.getState() instanceof Container) || !isAllowedShopContainer(containerBlock)) {
+            event.setCancelled(true);
+            renderShopSign(existing);
+            msg(player, "§cThe shop container is missing.");
+            return;
+        }
+
+        String mode = clean(event.getLine(0));
+        PricePair prices = parseFriendlyEditPrices(mode, clean(event.getLine(1)));
+        if (prices == null || (prices.buy <= 0.0D && prices.sell <= 0.0D)) {
+            event.setCancelled(true);
+            renderShopSign(existing);
+            msg(player, "§cInvalid shop type/price. Use [BUY], [SELL], or [BUY AND SELL].");
+            return;
+        }
+
+        String itemAmountLine = clean(event.getLine(2));
+        int amount = existing.amount;
+        String itemText = itemAmountLine;
+        int split = lastAmountSeparator(itemAmountLine);
+        if (split >= 0) {
+            itemText = itemAmountLine.substring(0, split).trim();
+            try {
+                amount = Integer.parseInt(itemAmountLine.substring(split + 2).trim());
+            } catch (Exception ex) {
+                event.setCancelled(true);
+                renderShopSign(existing);
+                msg(player, "§cInvalid amount on line 3. Example: Diamond x16");
+                return;
+            }
+        }
+        if (amount <= 0 || amount > MAX_AMOUNT) {
+            event.setCancelled(true);
+            renderShopSign(existing);
+            msg(player, "§cAmount must be between 1 and " + MAX_AMOUNT + ". Example: Diamond x16");
+            return;
+        }
+
+        ItemStack template;
+        if (itemText.isBlank() || itemText.equalsIgnoreCase("No Item Set")) {
+            template = null;
+        } else if (itemText.equals("?")) {
+            ItemStack hand = player.getInventory().getItemInMainHand();
+            if (hand == null || hand.getType() == Material.AIR) {
+                event.setCancelled(true);
+                renderShopSign(existing);
+                msg(player, "§cHold the exact item you want when using ? on line 3.");
