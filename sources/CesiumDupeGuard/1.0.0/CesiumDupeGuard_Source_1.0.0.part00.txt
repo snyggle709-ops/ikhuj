@@ -1,0 +1,180 @@
+===== plugin.yml =====
+name: CesiumDupeGuard
+version: 1.0.0
+main: com.cesiummc.dupeguard.CesiumDupeGuard
+api-version: '1.21'
+load: POSTWORLD
+commands:
+  dupeguard:
+    description: Open the OP-only CesiumDupeGuard control panel.
+    usage: /dupeguard
+
+===== src/com/cesiummc/dupeguard/CesiumDupeGuard.java =====
+package com.cesiummc.dupeguard;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockPistonExtendEvent;
+import org.bukkit.event.block.BlockPistonRetractEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityPortalEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public final class CesiumDupeGuard extends JavaPlugin implements Listener {
+    private static final String PREFIX = "§8[§cDupeGuard§8] §r";
+    private static final String GUI_TITLE = "§c§lCesium DupeGuard §8• §fProtection";
+
+    private File settingsFile;
+    private YamlConfiguration settingsYaml;
+    private Settings settings;
+    private BukkitTask auditTask;
+
+    private final AtomicLong pistonBlocks = new AtomicLong();
+    private final AtomicLong portalBlocks = new AtomicLong();
+    private final AtomicLong tripwireBlocks = new AtomicLong();
+    private final AtomicLong hardenRuns = new AtomicLong();
+
+    private volatile PaperState paperState = PaperState.unknown();
+    private long lastAlertMillis;
+
+    @Override
+    public void onEnable() {
+        if (!getDataFolder().exists() && !getDataFolder().mkdirs()) {
+            getLogger().warning("Could not create CesiumDupeGuard data folder.");
+        }
+        settingsFile = new File(getDataFolder(), "settings.yml");
+        loadSettings();
+        getServer().getPluginManager().registerEvents(this, this);
+
+        if (settings.enforcePaperSafeSettings) {
+            applySafePaperSettings(false);
+        } else {
+            auditPaperSettings();
+        }
+
+        auditTask = getServer().getScheduler().runTaskTimer(this, () -> {
+            try { auditPaperSettings(); }
+            catch (Throwable t) { getLogger().log(Level.WARNING, "Paper dupe-safety audit failed", t); }
+        }, 200L, Math.max(200L, settings.auditIntervalTicks));
+
+        getLogger().info("CesiumDupeGuard enabled in conservative mode. No player punishment, no item-count heuristics, no timing-based accusations.");
+    }
+
+    @Override
+    public void onDisable() {
+        if (auditTask != null) {
+            try { auditTask.cancel(); } catch (Throwable ignored) { }
+        }
+        saveSettings();
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!command.getName().equalsIgnoreCase("dupeguard")) return false;
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "This control panel is GUI-only and must be opened by an operator in game.");
+            return true;
+        }
+        if (!player.isOp()) {
+            player.sendMessage(PREFIX + "§cOnly server operators can use this command.");
+            play(player, "entity.villager.no", 0.8f, 0.8f);
+            return true;
+        }
+        openGui(player);
+        return true;
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPistonExtend(BlockPistonExtendEvent event) {
+        handlePiston(event, "extend");
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPistonRetract(BlockPistonRetractEvent event) {
+        handlePiston(event, "retract");
+    }
+
+    private void handlePiston(Object event, String kind) {
+        if (!settings.pistonBackstop) return;
+        // This backstop is intentionally dormant while Paper's native protection is confirmed safe.
+        // It only intervenes when allow-piston-duplication is explicitly true.
+        PaperState state = paperState;
+        if (!state.pistonUnsafe) return;
+
+        Object blocksObj = callQuiet(event, "getBlocks");
+        if (!(blocksObj instanceof Iterable<?> blocks)) return;
+        for (Object block : blocks) {
+            String mat = materialName(callQuiet(block, "getType"));
+            if (!isPaperPistonDupeMaterial(mat)) continue;
+            callQuiet(event, "setCancelled", true);
+            pistonBlocks.incrementAndGet();
+            blocked("Piston " + kind + " involving " + mat + " while Paper piston-duplication is enabled");
+            return;
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onTripwirePlace(BlockPlaceEvent event) {
+        if (!settings.tripwireBackstop || !paperState.tripwireUnsafe) return;
+        Object block = callQuiet(event, "getBlockPlaced");
+        String mat = materialName(callQuiet(block, "getType"));
+        if (!"TRIPWIRE_HOOK".equals(mat)) return;
+        callQuiet(event, "setCancelled", true);
+        tripwireBlocks.incrementAndGet();
+        blocked("Tripwire hook placement while Paper tripwire placement validation is disabled");
+        Object player = callQuiet(event, "getPlayer");
+        if (player instanceof Player p) {
+            p.sendMessage(PREFIX + "§cTripwire-hook placement is temporarily blocked because the server's Paper dupe protection is disabled. An operator must re-enable the safe setting and restart.");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onEntityPortal(EntityPortalEvent event) {
+        if (!settings.fallingBlockPortalBackstop) return;
+        Object entity = callQuiet(event, "getEntity");
+        if (entity == null || !isFallingBlock(entity)) return;
+        Object to = callQuiet(event, "getTo");
+        if (to == null) return;
+        Object world = callQuiet(to, "getWorld");
+        Object environment = callQuiet(world, "getEnvironment");
+        String env = environment == null ? "" : String.valueOf(environment);
+        if (!env.toUpperCase(Locale.ROOT).contains("THE_END")) return;
+
+        // Paper already fixes this by default. This independent backstop blocks the underlying
+        // falling-block End-portal transition rather than guessing whether a player is duping.
+        callQuiet(event, "setCancelled", true);
+        portalBlocks.incrementAndGet();
+        blocked("Falling block attempted to enter an End portal");
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onGuiClick(InventoryClickEvent event) {
+        if (!(event.getWhoClicked() instanceof Player player)) return;
