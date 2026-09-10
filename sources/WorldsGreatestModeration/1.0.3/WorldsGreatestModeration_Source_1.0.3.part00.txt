@@ -1,0 +1,250 @@
+package com.cesiummc.wgm;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.HumanEntity;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.server.ServerCommandEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemFlag;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.SkullMeta;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.*;
+import java.lang.reflect.Array;
+import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.security.SecureRandom;
+import java.sql.*;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.logging.Level;
+
+public final class WorldsGreatestModeration extends JavaPlugin implements Listener {
+    private static final String PREFIX = "§8[§6WGM§8] §r";
+    private static final String UI_MAIN = "§0WGM • Moderate";
+    private static final String UI_TARGET = "§0WGM • Target";
+    private static final String UI_DURATION = "§0WGM • Duration";
+    private static final String UI_REASON = "§0WGM • Reason";
+    private static final String UI_HISTORY = "§0WGM • History";
+    private static final String UI_WARNINGS = "§0WGM • Warnings";
+    private static final String UI_CONFIG = "§0WGM • Config";
+
+    private final ConcurrentMap<UUID, UiState> uiStates = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, Prompt> prompts = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, Punishment> muteCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, List<Punishment>> historyCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, List<Punishment>> warningsCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, List<String>> targetCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, PreLoginSnapshot> preLoginSnapshots = new ConcurrentHashMap<>();
+    private final Set<String> seenEventIds = new CopyOnWriteArraySet<>();
+    private final Map<String, Long> seenEventTimes = new ConcurrentHashMap<>();
+
+    private Database database;
+    private volatile Settings settings;
+    private volatile boolean ready;
+    private volatile String networkSecret;
+    private volatile long lastCleanup;
+    private volatile long lastSettingsRefresh;
+    private volatile boolean serverOfflineMode;
+    private volatile boolean proxyForwardingConfigured;
+
+    private static final Set<String> PROTECTED_COMMANDS = Set.of(
+            "ban", "unban", "pardon", "mute", "unmute", "kick", "blacklist", "unblacklist",
+            "warn", "unwarn", "warnings", "viewmodhistory", "moderate", "moderatorhelp", "config",
+            "tempban", "tempmute", "ban-ip", "ipban", "pardon-ip"
+    );
+
+    @Override
+    public void onEnable() {
+        try {
+            if (!getDataFolder().exists() && !getDataFolder().mkdirs()) {
+                throw new IOException("Could not create plugin data folder");
+            }
+            StorageConfig storage = StorageConfig.load(new File(getDataFolder(), "storage.properties"));
+            database = new Database(storage);
+            database.initialize();
+            networkSecret = database.getOrCreateSetting("privacy_hmac_secret", randomSecret());
+            settings = Settings.load(database);
+            serverOfflineMode = !serverOnlineMode();
+            proxyForwardingConfigured = detectProxyForwardingConfigured();
+            Bukkit.getPluginManager().registerEvents(this, this);
+            ready = true;
+            Bukkit.getScheduler().runTaskTimer(this, this::networkTick, 20L, 40L);
+            getLogger().info("WorldsGreatestModeration enabled using " + storage.type.toUpperCase(Locale.ROOT) + " storage.");
+            if (serverOfflineMode && !proxyForwardingConfigured) getLogger().info("Offline standalone identity mode active. Loopback connections are treated as the same test machine for alt-evasion testing.");
+            if (storage.type.equals("h2")) {
+                getLogger().warning("Standalone H2 storage is active. For proxy/network-wide moderation, set storage.type=mariadb on every backend and use the same database.");
+            }
+        } catch (Throwable t) {
+            ready = false;
+            getLogger().log(Level.SEVERE, "WorldsGreatestModeration could not start", t);
+        }
+    }
+
+    @Override
+    public void onDisable() {
+        ready = false;
+        try { Bukkit.getScheduler().cancelTasks(this); } catch (Throwable ignored) {}
+        uiStates.clear();
+        prompts.clear();
+        muteCache.clear();
+        preLoginSnapshots.clear();
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        dispatch(sender, canonicalLabel(label), args);
+        return true;
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        String label = canonicalLabel(alias);
+        if (args.length == 1 && !label.equals("config") && !label.equals("moderate") && !label.equals("moderatorhelp")) {
+            String start = args[0].toLowerCase(Locale.ROOT);
+            List<String> out = new ArrayList<>();
+            for (Player p : Bukkit.getOnlinePlayers()) if (p.getName().toLowerCase(Locale.ROOT).startsWith(start)) out.add(p.getName());
+            return out;
+        }
+        if ((label.equals("ban") || label.equals("mute") || label.equals("blacklist") || label.equals("warn") || label.equals("tempban") || label.equals("tempmute")) && args.length == 2) {
+            return startsWith(List.of("10m", "30m", "1h", "6h", "1d", "3d", "7d", "30d", "forever"), args[1]);
+        }
+        return Collections.emptyList();
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onCommandPreprocess(PlayerCommandPreprocessEvent event) {
+        String raw = event.getMessage();
+        if (raw == null || raw.length() < 2) return;
+        String body = raw.substring(1).trim();
+        if (body.isEmpty()) return;
+        String[] parts = body.split("\\s+");
+        String label = canonicalLabel(parts[0]);
+
+        if (PROTECTED_COMMANDS.contains(label)) {
+            event.setCancelled(true);
+            String[] args = Arrays.copyOfRange(parts, 1, parts.length);
+            dispatch(event.getPlayer(), label, args);
+            return;
+        }
+
+        Punishment mute = muteCache.get(event.getPlayer().getUniqueId());
+        if (mute != null && mute.isActive(System.currentTimeMillis())) {
+            if (settings.blockedMuteCommands.contains(label)) {
+                event.setCancelled(true);
+                event.getPlayer().sendMessage(muteMessage(mute));
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onServerCommand(ServerCommandEvent event) {
+        String raw = event.getCommand();
+        if (raw == null || raw.isBlank()) return;
+        String[] parts = raw.trim().split("\\s+");
+        String label = canonicalLabel(parts[0]);
+        if (!PROTECTED_COMMANDS.contains(label)) return;
+        if (parts[0].toLowerCase(Locale.ROOT).startsWith("worldsgreatestmoderation:")) return;
+        StringBuilder reroute = new StringBuilder("worldsgreatestmoderation:").append(label);
+        for (int i = 1; i < parts.length; i++) reroute.append(' ').append(parts[i]);
+        event.setCommand(reroute.toString());
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPreLogin(AsyncPlayerPreLoginEvent event) {
+        if (!ready) return;
+        try {
+            UUID uuid = event.getUniqueId();
+            String name = event.getName();
+            long now = System.currentTimeMillis();
+            InetAddress presented = event.getAddress();
+            InetAddress raw = rawPreLoginAddress(event);
+            AddressIdentity address = addressIdentity(presented);
+            boolean forwarded = raw != null && presented != null && !raw.equals(presented);
+            boolean knownBefore = database.firstSeen(uuid) > 0L;
+            PreLoginSnapshot snapshot = new PreLoginSnapshot(address.exactHash, address.networkHash, address.scope, forwarded, knownBefore, now);
+
+            Punishment direct = database.findStrongestActive(uuid, name, Set.of("BLACKLIST", "BAN"), now);
+            if (direct != null) {
+                database.observe(uuid, name, address.exactHash, address.networkHash, null);
+                database.recordLogin(uuid, name, address.exactHash, address.networkHash, null, now, false);
+                disallowRich(event, direct.type.equals("BLACKLIST") ? blacklistMessage(direct, false) : banMessage(direct, false));
+                return;
+            }
+
+            AltDecision decision = evaluateAlt(uuid, name, address.exactHash, address.networkHash, null, null, true, knownBefore, now, address.scope, forwarded);
+            database.observe(uuid, name, address.exactHash, address.networkHash, null);
+            database.recordLogin(uuid, name, address.exactHash, address.networkHash, null, now, decision == null || !decision.shouldAct);
+
+            if (decision != null && decision.shouldAct) {
+                Punishment applied = applyAltDecision(uuid, name, decision);
+                if (applied != null) {
+                    logAltDecision(name, decision, true);
+                    disallowRich(event, applied.type.equals("BLACKLIST") ? blacklistMessage(applied, true) : banMessage(applied, true));
+                    return;
+                }
+            } else if (decision != null && decision.score >= 60) {
+                maybeFlagAltSuspicion(uuid, name, decision);
+                logAltDecision(name, decision, false);
+            }
+            preLoginSnapshots.put(uuid, snapshot);
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "Pre-login moderation check failed for " + event.getName(), t);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onJoin(PlayerJoinEvent event) {
+        if (!ready) return;
+        Player player = event.getPlayer();
+        UUID playerId = player.getUniqueId();
+        String playerName = player.getName();
+        PreLoginSnapshot snapshot = preLoginSnapshots.remove(playerId);
+        AddressIdentity address = addressIdentityFromPlayer(player);
+        if (snapshot != null && snapshot.exactHash != null) address = new AddressIdentity(snapshot.exactHash, snapshot.networkHash, snapshot.scope);
+        String fingerprint = clientFingerprint(player);
+        final AddressIdentity resolvedAddress = address;
+        final boolean knownBefore = snapshot != null ? snapshot.knownBefore : safeKnownBefore(playerId);
+        final long loginAt = snapshot != null ? snapshot.loginAt : System.currentTimeMillis();
+        final boolean forwarded = snapshot != null && snapshot.forwarded;
+
+        resolveClientToken(player, clientTokenHash -> processJoinIdentity(playerId, playerName, resolvedAddress, fingerprint, clientTokenHash, knownBefore, loginAt, forwarded));
+    }
+
+    private void processJoinIdentity(UUID playerId, String playerName, AddressIdentity address, String fingerprint, String clientTokenHash, boolean knownBefore, long loginAt, boolean forwarded) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                database.observe(playerId, playerName, address.exactHash, address.networkHash, fingerprint);
+                database.enrichRecentLogin(playerId, loginAt, fingerprint);
+                if (clientTokenHash != null) database.observeClientToken(playerId, clientTokenHash);
+                database.startSession(playerId, address.exactHash, address.networkHash, fingerprint, loginAt);
+
+                Punishment direct = database.findStrongestActive(playerId, playerName, Set.of("BLACKLIST", "BAN"), System.currentTimeMillis());
+                if (direct != null) {
+                    kickByIdSync(playerId, direct.type.equals("BLACKLIST") ? blacklistMessage(direct, false) : banMessage(direct, false));
+                    return;
+                }
