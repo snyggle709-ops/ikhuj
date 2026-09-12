@@ -1,0 +1,194 @@
+        if(page>0)set(inv,46,item(Material.PAPER,"§ePrevious Page"));
+        set(inv,49,item(Material.YELLOW_CONCRETE,"§e"+target+"'s Warnings","§7Active warnings: §f"+list.size()));
+        if(from+36<list.size())set(inv,52,item(Material.PAPER,"§eNext Page"));
+        set(inv,53,item(Material.BARRIER,"§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("WARNINGS", "WARNINGS", target,0L,page,target));
+        player.openInventory(inv);
+    }
+
+
+    private void openWatchlistAsync(Player player, int page) {
+        if (!isModerator(player)) { noPermission(player); return; }
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                List<WatchEntry> list = database.listWatchlist(500);
+                watchlistCache.put(player.getUniqueId(), list);
+                sync(() -> openWatchlist(player, list, page));
+            } catch (Throwable t) {
+                asyncError(player, t);
+            }
+        });
+    }
+
+    private void openWatchlist(Player player, List<WatchEntry> list, int page) {
+        int maxPage = list.isEmpty() ? 0 : (list.size() - 1) / 36;
+        page = Math.max(0, Math.min(page, maxPage));
+        Inventory inv = Bukkit.createInventory(null, 54, UI_WATCHLIST);
+        fill(inv, Material.GRAY_STAINED_GLASS_PANE, " ");
+
+        int from = page * 36;
+        for (int i = 0; i < 36 && from + i < list.size(); i++) {
+            WatchEntry entry = list.get(from + i);
+            List<String> lore = new ArrayList<>();
+            lore.add("§7Possible alt of: §f" + entry.mainName);
+            lore.add("§7Review score: §f" + entry.score);
+            lore.add("§7First flagged: §f" + formatDate(entry.createdAt));
+            lore.add("§7Last matched: §f" + formatDate(entry.lastSeen));
+            lore.add("");
+            lore.add("§6Evidence:");
+            for (String piece : entry.evidence.split(",")) lore.add("§8• §f" + limit(piece.trim(), 46));
+            lore.add("");
+            lore.add("§aLeft-click: §7view suspect moderation history");
+            lore.add("§cRight-click: §7dismiss from watchlist");
+            lore.add("§8Review only — this entry did not punish the player.");
+
+            ItemStack head = item(Material.PLAYER_HEAD, "§6§l" + entry.suspectName, lore.toArray(new String[0]));
+            try {
+                ItemMeta meta = head.getItemMeta();
+                if (meta instanceof SkullMeta skull && entry.suspectUuid != null) {
+                    skull.setOwningPlayer(Bukkit.getOfflinePlayer(entry.suspectUuid));
+                    head.setItemMeta(skull);
+                }
+            } catch (Throwable ignored) {}
+            inv.setItem(targetSlot(i), head);
+        }
+
+        set(inv, 45, item(Material.OAK_SIGN, "§7Back"));
+        if (page > 0) set(inv, 46, item(Material.PAPER, "§ePrevious Page"));
+        set(inv, 49, item(Material.SPYGLASS, "§6§lBehavioral Alt Watchlist",
+                "§7Entries: §f" + list.size(),
+                "§7Page: §f" + (page + 1) + "/" + (maxPage + 1),
+                "",
+                "§8No watchlist entry is an automatic punishment."));
+        if (from + 36 < list.size()) set(inv, 52, item(Material.PAPER, "§eNext Page"));
+        set(inv, 53, item(Material.BARRIER, "§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("WATCHLIST", "WATCHLIST", null, 0L, page, null));
+        player.openInventory(inv);
+    }
+
+    private void dismissWatchEntry(Player player, WatchEntry entry, int page) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                database.dismissWatchEntry(entry.id, player.getName(), System.currentTimeMillis());
+                List<WatchEntry> fresh = database.listWatchlist(500);
+                watchlistCache.put(player.getUniqueId(), fresh);
+                sync(() -> openWatchlist(player, fresh, page));
+            } catch (Throwable t) {
+                asyncError(player, t);
+            }
+        });
+    }
+
+    private void sendWatchlistText(CommandSender sender) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                List<WatchEntry> list = database.listWatchlist(30);
+                sync(() -> {
+                    sender.sendMessage(PREFIX + "§6Behavioral alt watchlist: §f" + list.size() + (list.size() == 30 ? "+" : ""));
+                    for (WatchEntry e : list) {
+                        sender.sendMessage("§8- §f" + e.suspectName + " §7→ §f" + e.mainName + " §8• §6" + e.score
+                                + " §8• §7" + limit(e.evidence, 120));
+                    }
+                    sender.sendMessage("§8Behavioral entries are review-only and do not create punishments.");
+                });
+            } catch (Throwable t) {
+                asyncError(sender, t);
+            }
+        });
+    }
+
+    private void openConfig(Player player) {
+        Inventory inv=Bukkit.createInventory(null,54,UI_CONFIG);
+        fill(inv,Material.BLACK_STAINED_GLASS_PANE," ");
+        set(inv,10,item(Material.NAME_TAG,"§6§lServer Name","§7Current: §f"+settings.serverName,"","§eClick to edit"));
+        set(inv,12,item(Material.PAPER,"§b§lDiscord Appeal Link","§7Current: §f"+settings.discordUrl,"","§eClick to edit"));
+        set(inv,14,item(Material.PLAYER_HEAD,"§a§lModerator LP Roles","§7"+String.join(", ",settings.moderatorGroups),"","§eClick to edit"));
+        set(inv,16,item(Material.BELL,"§e§lAlt Alert LP Roles","§7"+String.join(", ",settings.alertGroups),"","§eClick to edit"));
+
+        set(inv,19,item(settings.behaviorWatchEnabled?Material.LIME_STAINED_GLASS_PANE:Material.RED_STAINED_GLASS_PANE,
+                "§6§lBehavior Watch: "+(settings.behaviorWatchEnabled?"§aON":"§cOFF"),
+                "§7Tracks review-only ban/blacklist-evasion behavior.",
+                "§7Never creates a punishment by itself.",
+                "",
+                "§eClick to toggle"));
+        set(inv,21,item(settings.accountAgeGate?Material.CLOCK:Material.REDSTONE,
+                "§e§l48-Hour Account Age Gate: "+(settings.accountAgeGate?"§aON":"§cOFF"),
+                "§7Confirmed Minecraft accounts under 48 hours old",
+                "§7are kicked without creating a punishment.",
+                "§7Lookup failures fail open to avoid false kicks.",
+                "",
+                "§eClick to toggle"));
+        set(inv,23,item(Material.RECOVERY_COMPASS,"§b§lOld Base Radius: §f"+settings.watchBaseRadius+" blocks",
+                "§7A suspect must remain around an old home/base",
+                "§7for at least 3 minutes before this signal counts.",
+                "§7RTP arrivals and crowded areas are excluded.",
+                "",
+                "§eClick to cycle"));
+        set(inv,25,item(Material.COMPASS,"§b§lNearby Join Radius: §f"+settings.watchGeoRadius+" blocks",
+                "§7Weak in-game proximity signal used only with",
+                "§7other independent behavioral evidence.",
+                "",
+                "§eClick to cycle"));
+
+        set(inv,28,item(Material.COMPARATOR,"§c§lIdentity Alt Detection: §f"+settings.altMode,
+                "§7Click to cycle:",
+                "§8OFF → SAFE → BALANCED → AGGRESSIVE",
+                "",
+                "§7Strong identity evidence keeps the existing behavior.",
+                "§7Behavioral watch signals never auto-punish."));
+        set(inv,30,item(settings.requireReasons?Material.LIME_STAINED_GLASS_PANE:Material.RED_STAINED_GLASS_PANE,
+                "§f§lRequire Reasons: "+(settings.requireReasons?"§aON":"§cOFF"),"§7Click to toggle"));
+        set(inv,32,item(Material.HOPPER,"§d§lMuted Command Blocks","§7"+String.join(", ",settings.blockedMuteCommands),"","§eClick to edit"));
+        set(inv,34,item(Material.ENDER_CHEST,"§b§lStorage","§7Mode: §f"+database.config.type.toUpperCase(Locale.ROOT),
+                "§7Network-wide: §f"+(database.config.type.equals("mariadb")?"YES":"NO"),"",
+                "§8Behavior watch data uses this same database."));
+
+        set(inv,37,item(Material.SPYGLASS,"§6§lWatchlist Threshold: §f"+settings.watchThreshold,
+                "§7Higher = fewer review entries.",
+                "§7Default 45 is conservative because the list",
+                "§7does not punish anyone.",
+                "",
+                "§eClick to cycle"));
+        set(inv,39,item(Material.GRASS_BLOCK,"§a§lExcluded Worlds",
+                "§7"+String.join(", ",settings.watchExcludedWorlds),
+                "",
+                "§7No location/base evidence is collected there.",
+                "§8world_cesiummc_spawn is excluded by default."));
+        set(inv,43,item(Material.BOOKSHELF,"§6§lOpen Alt Watchlist",
+                "§7Review behavioral suspects and evidence.",
+                "§7Right-click entries to dismiss them.",
+                "",
+                "§eClick to open"));
+        set(inv,49,item(Material.BARRIER,"§cClose"));
+        uiStates.put(player.getUniqueId(),new UiState("CONFIG",null,null,0L,0,null));
+        player.openInventory(inv);
+    }
+
+    private void handleUiClick(Player player, UiState state, int slot, boolean rightClick) {
+        switch(state.screen) {
+            case "MAIN" -> {
+                if(slot==49){closeUi(player);return;}
+                if(slot==40 && player.isOp()){openConfig(player);return;}
+                if(slot==42){openWatchlistAsync(player,0);return;}
+                String action=switch(slot){case 10->"BAN";case 12->"WARN";case 14->"KICK";case 16->"MUTE";case 20->"BLACKLIST";case 22->"REMOVE";case 24,32->"HISTORY";case 30->"WARNINGS";default->null;};
+                if(action!=null)openTarget(player,action,0);
+            }
+            case "TARGET" -> {
+                if(slot==45){openMain(player);return;} if(slot==53){closeUi(player);return;}
+                if(slot==46 && state.page>0){openTarget(player,state.action,state.page-1);return;}
+                if(slot==52){openTarget(player,state.action,state.page+1);return;}
+                if(slot==49){player.closeInventory();prompts.put(player.getUniqueId(),new Prompt("TARGET",state.action,null,0L));player.sendMessage(PREFIX+"§eType the username in chat, or type §fcancel§e.");return;}
+                if(slot>=0&&slot<36){
+                    List<String> names=targetCache.getOrDefault(player.getUniqueId(),Collections.emptyList());
+                    int idx=state.page*36+slot; if(idx<names.size()) continueUiForTarget(player,state.action,names.get(idx));
+                }
+            }
+            case "DURATION" -> {
+                if(slot==18){openTarget(player,state.action,0);return;} if(slot==26){closeUi(player);return;}
+                String raw=switch(slot){case 2->"10m";case 3->"1h";case 4->"6h";case 5->"1d";case 6->"7d";case 11->"30d";case 13->"forever";default->null;};
+                if(raw!=null){openReason(player,state.action,state.target,parseDuration(raw));return;}
+                if(slot==15){player.closeInventory();prompts.put(player.getUniqueId(),new Prompt("DURATION",state.action,state.target,0L));player.sendMessage(PREFIX+"§eType a duration like §f2w3d4h§e, or §fforever§e.");}
+            }
+            case "REASON" -> {
+                if(slot==35){closeUi(player);return;} if(slot==27){ if(Set.of("BAN","MUTE","BLACKLIST","WARN").contains(state.action))openDuration(player,state.action,state.target);else openTarget(player,state.action,0);return;}
+                String reason=switch(slot){case 10->"Cheating";case 11->"Exploiting";case 12->"Harassment";case 14->"Spam";case 15->"Inappropriate Behavior";case 16->"Ban Evasion";case 24->"";default->null;};
