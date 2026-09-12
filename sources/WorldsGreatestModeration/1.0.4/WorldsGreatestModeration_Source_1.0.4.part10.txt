@@ -1,0 +1,59 @@
+            this.watchExcludedWorlds=watchExcludedWorlds;
+        }
+        static Settings load(Database db)throws SQLException{
+            String server=db.getOrCreateSetting("server_name","CesiumMC");
+            String discord=db.getOrCreateSetting("discord_url","https://discord.gg/yourserver");
+            String mods=db.getOrCreateSetting("moderator_groups","owner,admin,moderator");
+            String alerts=db.getOrCreateSetting("alert_groups","owner,admin,moderator");
+            String alt=db.getOrCreateSetting("alt_mode","BALANCED").toUpperCase(Locale.ROOT);
+            String req=db.getOrCreateSetting("require_reasons","false");
+            String blocked=db.getOrCreateSetting("mute_blocked_commands","msg,tell,w,whisper,r,reply,me,emsg,etell");
+            boolean behavior=Boolean.parseBoolean(db.getOrCreateSetting("behavior_watch_enabled","true"));
+            boolean ageGate=Boolean.parseBoolean(db.getOrCreateSetting("account_age_gate","true"));
+            int baseRadius=intVal(db.getOrCreateSetting("watch_base_radius","96"),96,32,256);
+            int geoRadius=intVal(db.getOrCreateSetting("watch_geo_radius","192"),192,64,512);
+            int threshold=intVal(db.getOrCreateSetting("watch_threshold","45"),45,25,90);
+            Set<String> excluded=csvSet(db.getOrCreateSetting("watch_excluded_worlds","world_cesiummc_spawn"));
+            return new Settings(server,discord,csvSet(mods),csvSet(alerts),
+                    Set.of("OFF","SAFE","BALANCED","AGGRESSIVE").contains(alt)?alt:"BALANCED",
+                    Boolean.parseBoolean(req),csvSet(blocked),behavior,ageGate,baseRadius,geoRadius,threshold,excluded);
+        }
+        static int intVal(String s,int def,int min,int max){try{return Math.max(min,Math.min(max,Integer.parseInt(s.trim())));}catch(Exception e){return def;}}
+        static Set<String> csvSet(String s){Set<String> out=new LinkedHashSet<>();for(String x:s.split(",")){x=x.trim().toLowerCase(Locale.ROOT);if(!x.isEmpty())out.add(x);}return Collections.unmodifiableSet(out);}
+    }
+
+    private static final class StorageConfig {
+        final String type,host,database,user,password; final int port;
+        StorageConfig(String type,String host,int port,String database,String user,String password){this.type=type;this.host=host;this.port=port;this.database=database;this.user=user;this.password=password;}
+        static StorageConfig load(File file)throws IOException{
+            Properties p=new Properties();if(file.exists()){try(InputStream in=new FileInputStream(file)){p.load(in);}}else{p.setProperty("storage.type","h2");p.setProperty("mariadb.host","127.0.0.1");p.setProperty("mariadb.port","3306");p.setProperty("mariadb.database","worldsgreatestmoderation");p.setProperty("mariadb.user","minecraft");p.setProperty("mariadb.password","change-me");try(OutputStream out=new FileOutputStream(file)){p.store(out,"WorldsGreatestModeration storage. Use the SAME MariaDB database on every backend behind your proxy for network-wide moderation.");}}
+            String type=p.getProperty("storage.type","h2").trim().toLowerCase(Locale.ROOT);if(type.equals("mysql"))type="mariadb";int port;try{port=Integer.parseInt(p.getProperty("mariadb.port","3306"));}catch(Exception e){port=3306;}return new StorageConfig(type,p.getProperty("mariadb.host","127.0.0.1"),port,p.getProperty("mariadb.database","worldsgreatestmoderation"),p.getProperty("mariadb.user","minecraft"),p.getProperty("mariadb.password","change-me"));
+        }
+    }
+
+    private final class Database {
+        final StorageConfig config; final String url;
+        Database(StorageConfig config){this.config=config;if(config.type.equals("mariadb"))url="jdbc:mariadb://"+config.host+":"+config.port+"/"+config.database+"?useUnicode=true&characterEncoding=utf8&connectTimeout=5000&socketTimeout=10000";else url="jdbc:h2:file:"+new File(getDataFolder(),"moderation").getAbsolutePath()+";MODE=MySQL;DATABASE_TO_LOWER=TRUE";}
+        Connection open()throws SQLException{try{Class.forName(config.type.equals("mariadb")?"org.mariadb.jdbc.Driver":"org.h2.Driver");}catch(ClassNotFoundException e){throw new SQLException("Database driver missing. Leaf should download plugin.yml libraries automatically.",e);}return config.type.equals("mariadb")?DriverManager.getConnection(url,config.user,config.password):DriverManager.getConnection(url,"sa","");}
+        void initialize()throws SQLException{try(Connection c=open();Statement s=c.createStatement()){
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_punishments (id VARCHAR(36) PRIMARY KEY, type VARCHAR(24) NOT NULL, target_uuid VARCHAR(36), target_name VARCHAR(64) NOT NULL, target_key VARCHAR(64) NOT NULL, moderator_uuid VARCHAR(36), moderator_name VARCHAR(64) NOT NULL, moderator_display VARCHAR(255) NOT NULL, reason VARCHAR(1000) NOT NULL, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, active BOOLEAN NOT NULL, parent_id VARCHAR(36))");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_observations (id VARCHAR(36) PRIMARY KEY, uuid VARCHAR(36) NOT NULL, username_display VARCHAR(64) NOT NULL, username_key VARCHAR(64) NOT NULL, ip_hash VARCHAR(64), network_hash VARCHAR(80), fingerprint_hash VARCHAR(64), first_seen BIGINT NOT NULL, last_seen BIGINT NOT NULL, visits INT NOT NULL)");
+            try{s.executeUpdate("ALTER TABLE wgm_observations ADD COLUMN network_hash VARCHAR(80)");}catch(SQLException ignored){}
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_client_tokens (uuid VARCHAR(36) NOT NULL, token_hash VARCHAR(64) NOT NULL, first_seen BIGINT NOT NULL, last_seen BIGINT NOT NULL, PRIMARY KEY(uuid,token_hash))");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_logins (id VARCHAR(36) PRIMARY KEY, uuid VARCHAR(36) NOT NULL, username_display VARCHAR(64) NOT NULL, ip_hash VARCHAR(64), network_hash VARCHAR(80), fingerprint_hash VARCHAR(64), created_at BIGINT NOT NULL, allowed BOOLEAN NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_sessions (id VARCHAR(36) PRIMARY KEY, uuid VARCHAR(36) NOT NULL, ip_hash VARCHAR(64), network_hash VARCHAR(80), fingerprint_hash VARCHAR(64), joined_at BIGINT NOT NULL, left_at BIGINT NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_evasion (id VARCHAR(36) PRIMARY KEY, main_uuid VARCHAR(36) NOT NULL, alt_uuid VARCHAR(36) NOT NULL, kind VARCHAR(24) NOT NULL, confidence INT NOT NULL, created_at BIGINT NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_settings (setting_key VARCHAR(128) PRIMARY KEY, setting_value VARCHAR(2000) NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_events (id VARCHAR(36) PRIMARY KEY, event_type VARCHAR(32) NOT NULL, payload VARCHAR(1000) NOT NULL, created_at BIGINT NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_presence_heat (uuid VARCHAR(36) NOT NULL, world_name VARCHAR(128) NOT NULL, cell_x INT NOT NULL, cell_z INT NOT NULL, seconds_total BIGINT NOT NULL, last_seen BIGINT NOT NULL, PRIMARY KEY(uuid,world_name,cell_x,cell_z))");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_live_presence (uuid VARCHAR(36) PRIMARY KEY, username_display VARCHAR(64) NOT NULL, world_name VARCHAR(128) NOT NULL, x DOUBLE NOT NULL, y DOUBLE NOT NULL, z DOUBLE NOT NULL, updated_at BIGINT NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_last_position (uuid VARCHAR(36) PRIMARY KEY, username_display VARCHAR(64) NOT NULL, world_name VARCHAR(128) NOT NULL, x DOUBLE NOT NULL, y DOUBLE NOT NULL, z DOUBLE NOT NULL, updated_at BIGINT NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_home_history (id VARCHAR(36) PRIMARY KEY, uuid VARCHAR(36) NOT NULL, home_name VARCHAR(128) NOT NULL, world_name VARCHAR(128) NOT NULL, x DOUBLE NOT NULL, y DOUBLE NOT NULL, z DOUBLE NOT NULL, first_seen BIGINT NOT NULL, last_seen BIGINT NOT NULL)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_message_edges (sender_uuid VARCHAR(36) NOT NULL, recipient_uuid VARCHAR(36) NOT NULL, messages INT NOT NULL, last_at BIGINT NOT NULL, PRIMARY KEY(sender_uuid,recipient_uuid))");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_watchlist (id VARCHAR(36) PRIMARY KEY, suspect_uuid VARCHAR(36) NOT NULL, suspect_name VARCHAR(64) NOT NULL, main_uuid VARCHAR(36) NOT NULL, main_name VARCHAR(64) NOT NULL, score INT NOT NULL, evidence VARCHAR(1000) NOT NULL, created_at BIGINT NOT NULL, last_seen BIGINT NOT NULL, active BOOLEAN NOT NULL, dismissed_by VARCHAR(64), dismissed_at BIGINT)");
+            s.executeUpdate("CREATE TABLE IF NOT EXISTS wgm_account_age (uuid VARCHAR(36) PRIMARY KEY, created_at BIGINT, checked_at BIGINT NOT NULL, status VARCHAR(24) NOT NULL)");
+            try{s.executeUpdate("CREATE INDEX idx_wgm_p_target ON wgm_punishments(target_key,active)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_p_uuid ON wgm_punishments(target_uuid,active)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_obs_ip ON wgm_observations(ip_hash)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_obs_net ON wgm_observations(network_hash)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_obs_fp ON wgm_observations(fingerprint_hash)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_token_hash ON wgm_client_tokens(token_hash)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_login_ip_time ON wgm_logins(ip_hash,created_at)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_login_uuid_time ON wgm_logins(uuid,created_at)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_session_uuid_time ON wgm_sessions(uuid,joined_at,left_at)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_home_uuid ON wgm_home_history(uuid,last_seen)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_live_world ON wgm_live_presence(world_name,updated_at)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_msg_sender ON wgm_message_edges(sender_uuid,messages)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_watch_active ON wgm_watchlist(active,score,last_seen)");}catch(SQLException ignored){}try{s.executeUpdate("CREATE INDEX idx_wgm_watch_pair ON wgm_watchlist(suspect_uuid,main_uuid,active)");}catch(SQLException ignored){}
+        }}
+        String getOrCreateSetting(String key,String def)throws SQLException{String v=getSetting(key);if(v!=null)return v;try{setSetting(key,def);}catch(SQLException ignored){}v=getSetting(key);return v==null?def:v;}
+        String getSetting(String key)throws SQLException{try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT setting_value FROM wgm_settings WHERE setting_key=?")){p.setString(1,key);try(ResultSet r=p.executeQuery()){return r.next()?r.getString(1):null;}}}
+        void setSetting(String key,String value)throws SQLException{try(Connection c=open()){try(PreparedStatement p=c.prepareStatement("UPDATE wgm_settings SET setting_value=? WHERE setting_key=?")){p.setString(1,value);p.setString(2,key);if(p.executeUpdate()>0)return;}try(PreparedStatement p=c.prepareStatement("INSERT INTO wgm_settings(setting_key,setting_value) VALUES(?,?)")){p.setString(1,key);p.setString(2,value);p.executeUpdate();}}}
