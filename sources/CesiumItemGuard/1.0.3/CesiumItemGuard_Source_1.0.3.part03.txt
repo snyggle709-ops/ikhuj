@@ -1,0 +1,225 @@
+                out.add("pathological potion duration " + duration + " ticks");
+            }
+        }
+    }
+
+    private void inspectFirework(ItemMeta meta, Inspection out) {
+        if (findMethod(meta.getClass(), "getPower", 0) == null || findMethod(meta.getClass(), "getEffectsSize", 0) == null) return;
+        int power = intValue(callQuiet(meta, "getPower"), 0);
+        int effectCount = intValue(callQuiet(meta, "getEffectsSize"), 0);
+        if (power < 0 || power > cfg.maxFireworkPower) out.add("illegal firework power " + power);
+        if (effectCount > cfg.maxFireworkEffects) out.add("too many firework explosions " + effectCount);
+        Object effectsObj = callQuiet(meta, "getEffects");
+        if (effectsObj instanceof List<?>) {
+            for (Object effect : (List<?>) effectsObj) {
+                Object colors = callQuiet(effect, "getColors");
+                Object fades = callQuiet(effect, "getFadeColors");
+                int colorCount = colors instanceof Collection<?> ? ((Collection<?>) colors).size() : 0;
+                int fadeCount = fades instanceof Collection<?> ? ((Collection<?>) fades).size() : 0;
+                if (colorCount > cfg.maxFireworkColorsPerEffect || fadeCount > cfg.maxFireworkColorsPerEffect) {
+                    out.add("abusive firework color payload");
+                    break;
+                }
+            }
+        }
+    }
+
+    private void inspectBook(ItemMeta meta, Inspection out) {
+        if (findMethod(meta.getClass(), "getPageCount", 0) == null) return;
+        int pages = intValue(callQuiet(meta, "getPageCount"), 0);
+        if (pages > cfg.maxBookPages) out.add("book has too many pages (" + pages + ")");
+        Object pageList = callQuiet(meta, "getPages");
+        if (!(pageList instanceof List<?>)) return;
+        long total = 0;
+        for (Object p : (List<?>) pageList) {
+            if (!(p instanceof String)) continue;
+            int len = ((String) p).length();
+            total += len;
+            if (len > cfg.maxBookPageChars) out.add("book page too long (" + len + ")");
+            if (total > cfg.maxBookTotalChars) {
+                out.add("book text payload too large (" + total + " chars)");
+                break;
+            }
+        }
+        Object title = callQuiet(meta, "getTitle");
+        Object author = callQuiet(meta, "getAuthor");
+        if (title instanceof String && ((String) title).length() > cfg.maxBookTitleChars) out.add("book title too long");
+        if (author instanceof String && ((String) author).length() > cfg.maxBookAuthorChars) out.add("book author too long");
+    }
+
+    private void inspectBanner(ItemMeta meta, Inspection out) {
+        Method m = findMethod(meta.getClass(), "numberOfPatterns", 0);
+        if (m == null) return;
+        int count = intValue(invokeMethodQuiet(meta, m), 0);
+        if (count > cfg.maxBannerPatterns) out.add("abusive banner pattern count " + count);
+    }
+
+    private void inspectSpawnEgg(String type, ItemMeta meta, Inspection out) {
+        if (!type.endsWith("_SPAWN_EGG")) return;
+        if (!cfg.blockEmbeddedSpawnEggEntityData) return;
+        Method m = findMethod(meta.getClass(), "getSpawnedEntity", 0);
+        if (m != null) {
+            Object snapshot = invokeMethodQuiet(meta, m);
+            if (snapshot != null) out.add("spawn egg contains embedded entity snapshot/NBT");
+        }
+        Object custom = callQuiet(meta, "getCustomSpawnedType");
+        if (custom != null) out.add("spawn egg overrides its spawned entity type");
+    }
+
+    private void inspectNestedItems(String type, ItemMeta meta, Inspection out, int itemDepth, IdentityHashMap<Object, Boolean> seen) {
+        // Shulkers and other block-state inventory items.
+        Method blockStateMethod = findMethod(meta.getClass(), "getBlockState", 0);
+        if (blockStateMethod != null) {
+            Object state = invokeMethodQuiet(meta, blockStateMethod);
+            Object invObj = callQuiet(state, "getInventory");
+            Inventory inv = asInventory(invObj);
+            if (inv != null) {
+                if (itemDepth > 0 && isShulker(type)) out.add("nested shulker/container payload");
+                int nonEmpty = 0;
+                for (int i = 0; i < inv.getSize(); i++) {
+                    ItemStack child = inv.getItem(i);
+                    if (child == null || child.getType() == Material.AIR) continue;
+                    nonEmpty++;
+                    if (isShulker(safeType(child))) out.add("shulker contains another shulker");
+                    Inspection nested = inspect(child, itemDepth + 1, seen);
+                    if (nested.dangerous()) out.add("nested item " + safeType(child) + ": " + shortReasons(nested.reasons));
+                    if (nonEmpty > cfg.maxContainerEntries) {
+                        out.add("container has abnormal item count");
+                        break;
+                    }
+                }
+            }
+            if (type.contains("COMMAND_BLOCK")) {
+                Object command = callQuiet(state, "getCommand");
+                if (command instanceof String && !((String) command).isEmpty()) out.add("command-block item contains embedded command data");
+            }
+        }
+
+        // Bundles.
+        Method bundleItems = findMethod(meta.getClass(), "getItems", 0);
+        if (bundleItems != null && meta.getClass().getName().toLowerCase(Locale.ROOT).contains("bundle")) {
+            Object itemsObj = invokeMethodQuiet(meta, bundleItems);
+            if (itemsObj instanceof List<?>) {
+                List<?> list = (List<?>) itemsObj;
+                if (list.size() > cfg.maxContainerEntries) out.add("bundle contains too many entries");
+                for (Object o : list) {
+                    if (!(o instanceof ItemStack)) continue;
+                    ItemStack child = (ItemStack) o;
+                    if (isShulker(safeType(child))) out.add("bundle illegally contains shulker box");
+                    Inspection nested = inspect(child, itemDepth + 1, seen);
+                    if (nested.dangerous()) out.add("nested bundle item " + safeType(child) + ": " + shortReasons(nested.reasons));
+                }
+            }
+        }
+
+        // Charged crossbow projectiles can themselves carry abusive item data.
+        Method projectiles = findMethod(meta.getClass(), "getChargedProjectiles", 0);
+        if (projectiles != null) {
+            Object itemsObj = invokeMethodQuiet(meta, projectiles);
+            if (itemsObj instanceof List<?>) {
+                List<?> list = (List<?>) itemsObj;
+                if (list.size() > 3) out.add("crossbow contains abnormal charged-projectile count " + list.size());
+                for (Object o : list) {
+                    if (!(o instanceof ItemStack)) continue;
+                    Inspection nested = inspect((ItemStack) o, itemDepth + 1, seen);
+                    if (nested.dangerous()) out.add("dangerous charged projectile: " + shortReasons(nested.reasons));
+                }
+            }
+        }
+    }
+
+    private void inspectObjectGraph(Object value, String path, int depth, int itemDepth, Inspection out, IdentityHashMap<Object, Boolean> seenItems) {
+        if (value == null || out.reasons.size() >= cfg.maxReasonsPerItem) return;
+        if (depth > cfg.maxObjectGraphDepth) {
+            out.add("metadata object graph too deep");
+            return;
+        }
+        if (value instanceof String) {
+            int len = ((String) value).length();
+            String p = path.toLowerCase(Locale.ROOT);
+            int limit = cfg.maxGenericStringChars;
+            if (p.contains("display") || p.contains("name")) limit = Math.min(limit, cfg.maxDisplayNameChars * 4);
+            if (p.contains("lore")) limit = Math.min(limit, cfg.maxLoreLineChars * 4);
+            if (p.contains("page")) limit = Math.min(limit, cfg.maxBookPageChars * 2);
+            if (len > limit) out.add("oversized text component at " + compactPath(path) + " (" + len + " chars)");
+            return;
+        }
+        if (value instanceof Number) {
+            double d = ((Number) value).doubleValue();
+            if (!Double.isFinite(d)) out.add("non-finite numeric metadata at " + compactPath(path));
+            String p = path.toLowerCase(Locale.ROOT);
+            if (p.contains("amplifier") && (d < 0 || d > cfg.maxCustomPotionAmplifier)) out.add("illegal effect amplifier in serialized metadata");
+            if ((p.contains("custompotioncolor") || p.endsWith(".color")) && (d < 0 || d > 16777215D)) out.add("invalid potion/item color value");
+            return;
+        }
+        if (value instanceof ItemStack) {
+            Inspection nested = inspect((ItemStack) value, itemDepth + 1, seenItems);
+            if (nested.dangerous()) out.add("serialized nested item " + safeType((ItemStack) value) + ": " + shortReasons(nested.reasons));
+            return;
+        }
+        if (value instanceof Map<?, ?>) {
+            Map<?, ?> map = (Map<?, ?>) value;
+            if (map.size() > cfg.maxMapEntries) out.add("metadata map too large at " + compactPath(path) + " (" + map.size() + ")");
+            int seen = 0;
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                if (++seen > cfg.maxMapEntriesHardWalk) {
+                    out.add("metadata map walk limit exceeded");
+                    break;
+                }
+                String key = String.valueOf(e.getKey());
+                inspectObjectGraph(e.getValue(), path + "." + key, depth + 1, itemDepth, out, seenItems);
+            }
+            return;
+        }
+        if (value instanceof Collection<?>) {
+            Collection<?> c = (Collection<?>) value;
+            if (c.size() > cfg.maxCollectionEntries) out.add("metadata collection too large at " + compactPath(path) + " (" + c.size() + ")");
+            int i = 0;
+            for (Object o : c) {
+                if (i >= cfg.maxCollectionWalk) {
+                    out.add("metadata collection walk limit exceeded");
+                    break;
+                }
+                inspectObjectGraph(o, path + "[" + i + "]", depth + 1, itemDepth, out, seenItems);
+                i++;
+            }
+        }
+    }
+
+    private Inspection firstDanger(ItemStack... stacks) {
+        for (ItemStack stack : stacks) {
+            if (stack == null) continue;
+            Inspection i = inspect(stack);
+            if (i.dangerous()) return i;
+        }
+        return null;
+    }
+
+    private boolean isHighRiskType(String type) {
+        return isShulker(type) || type.contains("BOOK") || type.contains("POTION") || type.contains("FIREWORK") ||
+                type.endsWith("_SPAWN_EGG") || type.contains("BUNDLE") || type.equals("CROSSBOW") ||
+                type.contains("COMMAND_BLOCK") || type.equals("STRUCTURE_BLOCK") || type.equals("JIGSAW");
+    }
+
+    private static boolean isShulker(String type) {
+        return type != null && (type.equals("SHULKER_BOX") || type.endsWith("_SHULKER_BOX"));
+    }
+
+    /* ----------------------------- persistence/config ----------------------------- */
+
+    private void disableLegacyLocalBlacklist() {
+        File old = new File(getDataFolder(), "blacklisted.tsv");
+        File tmp = new File(getDataFolder(), "blacklisted.tsv.tmp");
+        if (tmp.isFile() && !tmp.delete()) {
+            getLogger().warning("Could not delete obsolete blacklisted.tsv.tmp; it is ignored by this version.");
+        }
+        if (!old.isFile()) return;
+        File disabled = new File(getDataFolder(), "blacklisted.tsv.disabled");
+        int suffix = 1;
+        while (disabled.exists()) {
+            disabled = new File(getDataFolder(), "blacklisted.tsv.disabled." + suffix++);
+        }
+        try {
+            Files.move(old.toPath(), disabled.toPath());
+            getLogger().warning("Disabled the legacy ItemGuard-local blacklist file. WGM is now the only blacklist authority. Legacy file: " + disabled.getName());
+        } catch (IOException e) {
