@@ -1,0 +1,156 @@
+            try (Connection c=open(); PreparedStatement p=c.prepareStatement("SELECT username_display FROM wgm_observations WHERE uuid=? ORDER BY last_seen DESC")) {
+                p.setString(1,uuid.toString()); try(ResultSet r=p.executeQuery()){ return r.next()?r.getString(1):uuid.toString(); }
+            }
+        }
+
+        void recordPresenceBatch(List<OnlineRef> online,long now,Set<String> excludedWorlds)throws SQLException {
+            if(online==null||online.isEmpty())return;
+            try(Connection c=open()){
+                for(OnlineRef ref:online){
+                    if(ref==null||ref.uuid==null||ref.world==null||ref.world.isBlank())continue;
+                    if(!Double.isFinite(ref.x)||!Double.isFinite(ref.y)||!Double.isFinite(ref.z))continue;
+                    String uuid=ref.uuid.toString();
+
+                    try(PreparedStatement u=c.prepareStatement("UPDATE wgm_live_presence SET username_display=?,world_name=?,x=?,y=?,z=?,updated_at=? WHERE uuid=?")){
+                        u.setString(1,ref.name);u.setString(2,ref.world);u.setDouble(3,ref.x);u.setDouble(4,ref.y);u.setDouble(5,ref.z);u.setLong(6,now);u.setString(7,uuid);
+                        if(u.executeUpdate()==0){
+                            try(PreparedStatement q=c.prepareStatement("INSERT INTO wgm_live_presence(uuid,username_display,world_name,x,y,z,updated_at) VALUES(?,?,?,?,?,?,?)")){
+                                q.setString(1,uuid);q.setString(2,ref.name);q.setString(3,ref.world);q.setDouble(4,ref.x);q.setDouble(5,ref.y);q.setDouble(6,ref.z);q.setLong(7,now);
+                                try{q.executeUpdate();}catch(SQLException race){try(PreparedStatement retry=c.prepareStatement("UPDATE wgm_live_presence SET username_display=?,world_name=?,x=?,y=?,z=?,updated_at=? WHERE uuid=?")){retry.setString(1,ref.name);retry.setString(2,ref.world);retry.setDouble(3,ref.x);retry.setDouble(4,ref.y);retry.setDouble(5,ref.z);retry.setLong(6,now);retry.setString(7,uuid);retry.executeUpdate();}}
+                            }
+                        }
+                    }
+
+                    try(PreparedStatement u=c.prepareStatement("UPDATE wgm_last_position SET username_display=?,world_name=?,x=?,y=?,z=?,updated_at=? WHERE uuid=?")){
+                        u.setString(1,ref.name);u.setString(2,ref.world);u.setDouble(3,ref.x);u.setDouble(4,ref.y);u.setDouble(5,ref.z);u.setLong(6,now);u.setString(7,uuid);
+                        if(u.executeUpdate()==0){
+                            try(PreparedStatement q=c.prepareStatement("INSERT INTO wgm_last_position(uuid,username_display,world_name,x,y,z,updated_at) VALUES(?,?,?,?,?,?,?)")){
+                                q.setString(1,uuid);q.setString(2,ref.name);q.setString(3,ref.world);q.setDouble(4,ref.x);q.setDouble(5,ref.y);q.setDouble(6,ref.z);q.setLong(7,now);
+                                try{q.executeUpdate();}catch(SQLException race){}
+                            }
+                        }
+                    }
+
+                    if(excludedWorlds!=null&&excludedWorlds.contains(ref.world.toLowerCase(Locale.ROOT)))continue;
+                    int cellX=Math.floorDiv((int)Math.floor(ref.x),64);
+                    int cellZ=Math.floorDiv((int)Math.floor(ref.z),64);
+                    try(PreparedStatement u=c.prepareStatement("UPDATE wgm_presence_heat SET seconds_total=seconds_total+?,last_seen=? WHERE uuid=? AND world_name=? AND cell_x=? AND cell_z=?")){
+                        u.setLong(1,BEHAVIOR_SAMPLE_MS/1000L);u.setLong(2,now);u.setString(3,uuid);u.setString(4,ref.world);u.setInt(5,cellX);u.setInt(6,cellZ);
+                        if(u.executeUpdate()==0){
+                            try(PreparedStatement q=c.prepareStatement("INSERT INTO wgm_presence_heat(uuid,world_name,cell_x,cell_z,seconds_total,last_seen) VALUES(?,?,?,?,?,?)")){
+                                q.setString(1,uuid);q.setString(2,ref.world);q.setInt(3,cellX);q.setInt(4,cellZ);q.setLong(5,BEHAVIOR_SAMPLE_MS/1000L);q.setLong(6,now);
+                                try{q.executeUpdate();}catch(SQLException race){try(PreparedStatement retry=c.prepareStatement("UPDATE wgm_presence_heat SET seconds_total=seconds_total+?,last_seen=? WHERE uuid=? AND world_name=? AND cell_x=? AND cell_z=?")){retry.setLong(1,BEHAVIOR_SAMPLE_MS/1000L);retry.setLong(2,now);retry.setString(3,uuid);retry.setString(4,ref.world);retry.setInt(5,cellX);retry.setInt(6,cellZ);retry.executeUpdate();}}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        void observeHome(UUID uuid,HomePoint point,long now)throws SQLException {
+            if(uuid==null||point==null)return;
+            String foundId=null;
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT id,x,z FROM wgm_home_history WHERE uuid=? AND home_name=? AND world_name=? ORDER BY last_seen DESC")){
+                p.setString(1,uuid.toString());p.setString(2,point.name);p.setString(3,point.world);
+                try(ResultSet r=p.executeQuery()){
+                    while(r.next()){
+                        double dx=r.getDouble(2)-point.x,dz=r.getDouble(3)-point.z;
+                        if(dx*dx+dz*dz<=48.0*48.0){foundId=r.getString(1);break;}
+                    }
+                }
+            }
+            if(foundId!=null){
+                try(Connection c=open();PreparedStatement p=c.prepareStatement("UPDATE wgm_home_history SET x=?,y=?,z=?,last_seen=? WHERE id=?")){
+                    p.setDouble(1,point.x);p.setDouble(2,point.y);p.setDouble(3,point.z);p.setLong(4,now);p.setString(5,foundId);p.executeUpdate();
+                }
+            }else{
+                try(Connection c=open();PreparedStatement p=c.prepareStatement("INSERT INTO wgm_home_history(id,uuid,home_name,world_name,x,y,z,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?)")){
+                    p.setString(1,UUID.randomUUID().toString());p.setString(2,uuid.toString());p.setString(3,point.name);p.setString(4,point.world);p.setDouble(5,point.x);p.setDouble(6,point.y);p.setDouble(7,point.z);p.setLong(8,now);p.setLong(9,now);p.executeUpdate();
+                }
+            }
+        }
+
+        void observeExplicitLastPosition(OnlineRef ref,long now)throws SQLException {
+            if(ref==null||ref.uuid==null||ref.world==null||ref.world.isBlank())return;
+            try(Connection c=open();PreparedStatement u=c.prepareStatement("UPDATE wgm_last_position SET username_display=?,world_name=?,x=?,y=?,z=?,updated_at=? WHERE uuid=?")){
+                u.setString(1,ref.name);u.setString(2,ref.world);u.setDouble(3,ref.x);u.setDouble(4,ref.y);u.setDouble(5,ref.z);u.setLong(6,now);u.setString(7,ref.uuid.toString());
+                if(u.executeUpdate()==0){
+                    try(PreparedStatement q=c.prepareStatement("INSERT INTO wgm_last_position(uuid,username_display,world_name,x,y,z,updated_at) VALUES(?,?,?,?,?,?,?)")){
+                        q.setString(1,ref.uuid.toString());q.setString(2,ref.name);q.setString(3,ref.world);q.setDouble(4,ref.x);q.setDouble(5,ref.y);q.setDouble(6,ref.z);q.setLong(7,now);try{q.executeUpdate();}catch(SQLException ignored){}
+                    }
+                }
+            }
+        }
+
+        void observeHistoricalLastPosition(UUID uuid,String name,BasePoint point,long now)throws SQLException {
+            if(uuid==null||point==null)return;
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT 1 FROM wgm_last_position WHERE uuid=?")){
+                p.setString(1,uuid.toString());
+                try(ResultSet r=p.executeQuery()){if(r.next())return;}
+            }
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("INSERT INTO wgm_last_position(uuid,username_display,world_name,x,y,z,updated_at) VALUES(?,?,?,?,?,?,?)")){
+                p.setString(1,uuid.toString());p.setString(2,limit(name,64));p.setString(3,point.world);p.setDouble(4,point.x);p.setDouble(5,point.y);p.setDouble(6,point.z);p.setLong(7,now);
+                try{p.executeUpdate();}catch(SQLException ignored){}
+            }
+        }
+
+        List<BasePoint> behaviorAnchors(UUID uuid,Set<String> excludedWorlds)throws SQLException {
+            List<BasePoint> out=new ArrayList<>();
+            if(uuid==null)return out;
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT home_name,world_name,x,y,z,last_seen FROM wgm_home_history WHERE uuid=? ORDER BY last_seen DESC")){
+                p.setString(1,uuid.toString());
+                try(ResultSet r=p.executeQuery()){
+                    while(r.next()&&out.size()<8){
+                        String world=r.getString(2);
+                        if(excludedWorlds!=null&&excludedWorlds.contains(world.toLowerCase(Locale.ROOT)))continue;
+                        BasePoint candidate=new BasePoint("HOME",world,r.getDouble(3),r.getDouble(4),r.getDouble(5),r.getLong(6));
+                        boolean duplicate=false;
+                        for(BasePoint existing:out)if(existing.world.equalsIgnoreCase(candidate.world)&&horizontalDistance(existing.x,existing.z,candidate.x,candidate.z)<32){duplicate=true;break;}
+                        if(!duplicate)out.add(candidate);
+                    }
+                }
+            }
+
+            boolean hasHome=!out.isEmpty();
+            if(!hasHome){
+                try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT world_name,cell_x,cell_z,seconds_total,last_seen FROM wgm_presence_heat WHERE uuid=? AND seconds_total>=? ORDER BY seconds_total DESC,last_seen DESC")){
+                    p.setString(1,uuid.toString());p.setLong(2,30L*60L);
+                    try(ResultSet r=p.executeQuery()){
+                        if(r.next()){
+                            String world=r.getString(1);
+                            if(excludedWorlds==null||!excludedWorlds.contains(world.toLowerCase(Locale.ROOT))){
+                                int cellX=r.getInt(2),cellZ=r.getInt(3);
+                                out.add(new BasePoint("HEAT",world,cellX*64.0+32.0,64.0,cellZ*64.0+32.0,r.getLong(4)));
+                            }
+                        }
+                    }
+                }
+            }
+
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT world_name,x,y,z,updated_at FROM wgm_last_position WHERE uuid=?")){
+                p.setString(1,uuid.toString());
+                try(ResultSet r=p.executeQuery()){
+                    if(r.next()){
+                        String world=r.getString(1);
+                        if(excludedWorlds==null||!excludedWorlds.contains(world.toLowerCase(Locale.ROOT))){
+                            BasePoint last=new BasePoint("LAST",world,r.getDouble(2),r.getDouble(3),r.getDouble(4),r.getLong(5));
+                            boolean duplicate=false;
+                            for(BasePoint existing:out)if(existing.world.equalsIgnoreCase(last.world)&&horizontalDistance(existing.x,existing.z,last.x,last.z)<24){duplicate=true;break;}
+                            if(!duplicate)out.add(last);
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        int livePlayersNear(String world,double x,double z,int radius,long cutoff,UUID exceptA,UUID exceptB)throws SQLException {
+            if(world==null)return 0;
+            int count=0;
+            double r2=(double)radius*radius;
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT uuid,x,z FROM wgm_live_presence WHERE world_name=? AND updated_at>=?")){
+                p.setString(1,world);p.setLong(2,cutoff);
+                try(ResultSet rs=p.executeQuery()){
+                    while(rs.next()){
+                        UUID u=uuid(rs.getString(1));
+                        if(u==null||u.equals(exceptA)||u.equals(exceptB))continue;
