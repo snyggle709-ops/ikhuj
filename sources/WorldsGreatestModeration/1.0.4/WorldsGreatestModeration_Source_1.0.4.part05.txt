@@ -1,0 +1,181 @@
+        long now = System.currentTimeMillis();
+        return new Punishment(UUID.randomUUID().toString(), type, uuid, name, null, "SYSTEM", "§c[SYSTEM]", reason, now, expiresAt, true, parentId);
+    }
+
+    private void openMain(Player player) {
+        Inventory inv = Bukkit.createInventory(null, 54, UI_MAIN);
+        fill(inv, Material.BLACK_STAINED_GLASS_PANE, " ");
+        set(inv, 4, item(Material.NETHER_STAR, "§6§lWorldsGreatestModeration", "§7Network moderation control center", "§8Fast • global • audited"));
+        set(inv, 10, actionItem(Material.IRON_BARS, "§c§lBan", "BAN", "§7Temporarily or permanently ban an account."));
+        set(inv, 12, actionItem(Material.BOOK, "§6§lWarn", "WARN", "§7Issue a timed or permanent warning."));
+        set(inv, 14, actionItem(Material.FEATHER, "§e§lKick", "KICK", "§7Disconnect a player from the network."));
+        set(inv, 16, actionItem(Material.REDSTONE_TORCH, "§d§lMute", "MUTE", "§7Block chat and common message commands."));
+        set(inv, 20, actionItem(Material.TNT, "§4§lBlacklist", "BLACKLIST", "§7Timed or permanent network exclusion.", "§cUse only for severe cases."));
+        set(inv, 22, actionItem(Material.LIME_STAINED_GLASS_PANE, "§a§lRemove Punishment", "UNBAN", "§7Unban, unmute, or unblacklist."));
+        set(inv, 24, actionItem(Material.BOOKSHELF, "§b§lHistory", "HISTORY", "§7View complete moderation history."));
+        set(inv, 30, actionItem(Material.YELLOW_CONCRETE, "§e§lWarnings", "WARNINGS", "§7View active warnings for a player."));
+        set(inv, 32, actionItem(Material.PLAYER_HEAD, "§f§lPlayer Lookup", "HISTORY", "§7Choose an online player or enter a name."));
+        if (player.isOp()) set(inv, 40, item(Material.COMPARATOR, "§c§lConfiguration", "§7OP-only network configuration."));
+        set(inv, 42, item(Material.SPYGLASS, "§6§lAlt Watchlist", "§7Behavioral blacklist/ban-evasion review queue.", "§7No behavioral signal here auto-punishes anyone.", "", "§eClick to review"));
+        set(inv, 49, item(Material.BARRIER, "§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("MAIN", null, null, 0L, 0, null));
+        player.openInventory(inv);
+    }
+
+    private ItemStack actionItem(Material material, String name, String action, String... lore) {
+        List<String> lines = new ArrayList<>(Arrays.asList(lore));
+        lines.add(""); lines.add("§eClick to select a player");
+        return item(material, name, lines.toArray(new String[0]));
+    }
+
+    private void openTarget(Player player, String action, int page) {
+        Inventory inv = Bukkit.createInventory(null, 54, UI_TARGET);
+        fill(inv, Material.GRAY_STAINED_GLASS_PANE, " ");
+        List<Player> online = new ArrayList<>();
+        for (Player p : Bukkit.getOnlinePlayers()) online.add(p);
+        online.sort(Comparator.comparing(Player::getName, String.CASE_INSENSITIVE_ORDER));
+        List<String> targetNames = new ArrayList<>(); for (Player p : online) targetNames.add(p.getName());
+        targetCache.put(player.getUniqueId(), targetNames);
+        int from = page * 36;
+        for (int i = 0; i < 36 && from + i < online.size(); i++) {
+            Player target = online.get(from + i);
+            int slot = targetSlot(i);
+            ItemStack head = item(Material.PLAYER_HEAD, "§f§l" + target.getName(), "§7Click to select", "§8Action: §f" + actionLabel(action));
+            try {
+                ItemMeta meta = head.getItemMeta();
+                if (meta instanceof SkullMeta skull) { skull.setOwningPlayer(target); head.setItemMeta(skull); }
+            } catch (Throwable ignored) {}
+            inv.setItem(slot, head);
+        }
+        set(inv, 45, item(Material.OAK_SIGN, "§7Back"));
+        if (page > 0) set(inv, 46, item(Material.PAPER, "§ePrevious Page"));
+        set(inv, 49, item(Material.NAME_TAG, "§6§lEnter Username", "§7Click, then type any username in chat.", "§7Works for offline players too."));
+        if (from + 36 < online.size()) set(inv, 52, item(Material.PAPER, "§eNext Page"));
+        set(inv, 53, item(Material.BARRIER, "§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("TARGET", action, null, 0L, page, null));
+        player.openInventory(inv);
+    }
+
+    private int targetSlot(int i) {
+        int row = i / 9;
+        int col = i % 9;
+        return row * 9 + col;
+    }
+
+    private void openDuration(Player player, String action, String target) {
+        Inventory inv = Bukkit.createInventory(null, 27, UI_DURATION);
+        fill(inv, Material.BLACK_STAINED_GLASS_PANE, " ");
+        set(inv, 2, durationItem("10 Minutes", "10m"));
+        set(inv, 3, durationItem("1 Hour", "1h"));
+        set(inv, 4, durationItem("6 Hours", "6h"));
+        set(inv, 5, durationItem("1 Day", "1d"));
+        set(inv, 6, durationItem("7 Days", "7d"));
+        set(inv, 11, durationItem("30 Days", "30d"));
+        set(inv, 13, item(Material.BARRIER, "§4§lForever", "§cPermanent until manually removed."));
+        set(inv, 15, item(Material.NAME_TAG, "§e§lCustom Duration", "§7Type a duration such as §f2w3d4h§7."));
+        set(inv, 18, item(Material.OAK_SIGN, "§7Back"));
+        set(inv, 26, item(Material.BARRIER, "§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("DURATION", action, target, 0L, 0, null));
+        player.openInventory(inv);
+    }
+
+    private ItemStack durationItem(String label, String raw) { return item(Material.CLOCK, "§e§l" + label, "§7" + raw, "", "§aClick to choose"); }
+
+    private void openReason(Player player, String action, String target, long duration) {
+        Inventory inv = Bukkit.createInventory(null, 36, UI_REASON);
+        fill(inv, Material.GRAY_STAINED_GLASS_PANE, " ");
+        String[] reasons = {"Cheating", "Exploiting", "Harassment", "Spam", "Inappropriate Behavior", "Ban Evasion"};
+        int[] slots = {10,11,12,14,15,16};
+        for (int i=0;i<reasons.length;i++) set(inv, slots[i], item(Material.PAPER, "§f§l" + reasons[i], "§aClick to use this reason"));
+        set(inv, 22, item(Material.WRITABLE_BOOK, "§e§lCustom Reason", "§7Type your own reason in chat."));
+        set(inv, 24, item(Material.FEATHER, "§7No Reason", "§7Use §f[no reason provided]§7."));
+        set(inv, 27, item(Material.OAK_SIGN, "§7Back"));
+        set(inv, 35, item(Material.BARRIER, "§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("REASON", action, target, duration, 0, null));
+        player.openInventory(inv);
+    }
+
+    private void openRemoveMenu(Player player, String target) {
+        Inventory inv = Bukkit.createInventory(null, 27, UI_REASON);
+        fill(inv, Material.BLACK_STAINED_GLASS_PANE, " ");
+        set(inv, 10, item(Material.LIME_STAINED_GLASS_PANE, "§a§lUnban", "§7Remove active ban from " + target));
+        set(inv, 12, item(Material.LIME_STAINED_GLASS_PANE, "§a§lUnmute", "§7Remove active mute from " + target));
+        set(inv, 14, item(Material.LIME_STAINED_GLASS_PANE, "§a§lUnblacklist", "§7Remove active blacklist from " + target));
+        set(inv, 16, item(Material.YELLOW_CONCRETE, "§e§lRemove Warning", "§7Open warnings and right-click one to remove."));
+        set(inv, 18, item(Material.OAK_SIGN, "§7Back"));
+        uiStates.put(player.getUniqueId(), new UiState("REMOVE", "REMOVE", target, 0L, 0, null));
+        player.openInventory(inv);
+    }
+
+    private void openHistoryAsync(Player player, String target) {
+        player.sendMessage(PREFIX + "§7Loading moderation history for §f" + target + "§7...");
+        UUID targetUuid = knownUuid(target);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                List<Punishment> list = database.history(targetUuid, target, 250);
+                historyCache.put(player.getUniqueId(), list);
+                sync(() -> openHistory(player, target, 0));
+            } catch (Throwable t) { asyncError(player, t); }
+        });
+    }
+
+    private void openHistory(Player player, String target, int page) {
+        Inventory inv = Bukkit.createInventory(null, 54, UI_HISTORY);
+        fill(inv, Material.BLACK_STAINED_GLASS_PANE, " ");
+        List<Punishment> list = historyCache.getOrDefault(player.getUniqueId(), Collections.emptyList());
+        int from = page * 36;
+        for (int i=0;i<36 && from+i<list.size();i++) {
+            Punishment p = list.get(from+i);
+            Material m = switch (p.type) { case "BAN" -> Material.IRON_BARS; case "BLACKLIST" -> Material.TNT; case "MUTE" -> Material.REDSTONE_TORCH; case "WARN" -> Material.YELLOW_CONCRETE; case "KICK" -> Material.FEATHER; default -> Material.PAPER; };
+            List<String> lore = new ArrayList<>();
+            lore.add("§7ID: §f" + p.id);
+            lore.add("§7Moderator: §f" + stripColors(p.moderatorDisplay));
+            lore.add("§7When: §f" + formatDate(p.createdAt));
+            if (p.expiresAt == 0 && Set.of("BAN", "MUTE", "BLACKLIST", "WARN").contains(p.type)) lore.add("§7Duration: §cForever");
+            else if (p.expiresAt > p.createdAt) lore.add("§7Duration: §f" + formatDuration(p.expiresAt - p.createdAt));
+            lore.add("§7Status: " + (p.isActive(System.currentTimeMillis()) ? "§aACTIVE" : "§8INACTIVE"));
+            lore.add("§7Reason: §f" + p.reason);
+            if (p.isActive(System.currentTimeMillis()) && isModerator(player) && Set.of("BAN","MUTE","BLACKLIST","WARN").contains(p.type)) { lore.add(""); lore.add("§cRight-click to remove this action"); }
+            inv.setItem(targetSlot(i), item(m, "§f§l" + p.type, lore.toArray(new String[0])));
+        }
+        set(inv,45,item(Material.OAK_SIGN,"§7Back"));
+        if(page>0)set(inv,46,item(Material.PAPER,"§ePrevious Page"));
+        set(inv,49,item(Material.NAME_TAG,"§f"+target,"§7"+list.size()+" history entries"));
+        if(from+36<list.size())set(inv,52,item(Material.PAPER,"§eNext Page"));
+        set(inv,53,item(Material.BARRIER,"§cClose"));
+        uiStates.put(player.getUniqueId(), new UiState("HISTORY", "HISTORY", target, 0L, page, target));
+        player.openInventory(inv);
+    }
+
+    private void openWarningsAsync(Player player, String target) {
+        UUID targetUuid = knownUuid(target);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                List<Punishment> list = database.activeWarnings(targetUuid, target);
+                warningsCache.put(player.getUniqueId(), list);
+                sync(() -> openWarnings(player, target, 0));
+            } catch (Throwable t) { asyncError(player, t); }
+        });
+    }
+
+    private void openWarnings(Player player, String target, int page) {
+        Inventory inv = Bukkit.createInventory(null, 54, UI_WARNINGS);
+        fill(inv, Material.BLACK_STAINED_GLASS_PANE, " ");
+        List<Punishment> list = warningsCache.getOrDefault(player.getUniqueId(), Collections.emptyList());
+        int from = page * 36;
+        for(int i=0;i<36 && from+i<list.size();i++) {
+            Punishment p=list.get(from+i);
+            List<String> lore=new ArrayList<>();
+            lore.add("§7Warning ID: §f"+p.id);
+            lore.add("§7Date: §f"+formatDate(p.createdAt));
+            lore.add("§7Moderator: §f"+stripColors(p.moderatorDisplay));
+            if(p.expiresAt==0) lore.add("§7Duration: §cForever");
+            else {
+                lore.add("§7Duration: §f"+formatDuration(Math.max(0L,p.expiresAt-p.createdAt)));
+                lore.add("§7Expires in: §f"+formatDuration(Math.max(0L,p.expiresAt-System.currentTimeMillis())));
+            }
+            lore.add("§7Reason: §f"+p.reason);
+            if(isModerator(player)){lore.add("");lore.add("§cRight-click to remove this warning");}
+            inv.setItem(targetSlot(i),item(Material.YELLOW_CONCRETE,"§e§l⚠ Warning",lore.toArray(new String[0])));
+        }
+        set(inv,45,item(Material.OAK_SIGN,"§7Back"));
