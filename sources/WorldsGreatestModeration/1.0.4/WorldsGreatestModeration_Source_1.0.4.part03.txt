@@ -1,0 +1,217 @@
+            case "unmute" -> commandRevoke(sender, "MUTE", args, "/unmute <user> [reason]");
+            case "unblacklist" -> commandRevoke(sender, "BLACKLIST", args, "/unblacklist <user> [reason]");
+            case "unwarn" -> commandUnwarn(sender, args);
+            default -> moderatorHelp(sender);
+        }
+    }
+
+    private void commandTimed(CommandSender sender, String type, String[] args, String usage) {
+        if (args.length < 2) { sender.sendMessage(PREFIX + "§cUsage: " + usage); return; }
+        long duration = parseDuration(args[1]);
+        if (duration == Long.MIN_VALUE || duration == 0) { sender.sendMessage(PREFIX + "§cInvalid duration. Use s/m/h/d/w/mo/y or forever."); return; }
+        String reason = join(args, 2);
+        if (!reasonAllowed(sender, reason)) return;
+        submitPunishment(sender, type, normalizeTarget(args[0]), duration, normalizeReason(reason));
+    }
+
+    private void commandSimple(CommandSender sender, String type, String[] args, String usage) {
+        if (args.length < 1) { sender.sendMessage(PREFIX + "§cUsage: " + usage); return; }
+        String reason = join(args, 1);
+        if (!reasonAllowed(sender, reason)) return;
+        submitPunishment(sender, type, normalizeTarget(args[0]), 0L, normalizeReason(reason));
+    }
+
+    private void commandRevoke(CommandSender sender, String type, String[] args, String usage) {
+        if (args.length < 1) { sender.sendMessage(PREFIX + "§cUsage: " + usage); return; }
+        String target = normalizeTarget(args[0]);
+        String reason = normalizeReason(join(args, 1));
+        UUID targetUuid = knownUuid(target);
+        String modName = senderName(sender);
+        String modDisplay = moderatorDisplay(sender);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                int changed = database.deactivate(type, targetUuid, target);
+                if (type.equals("BAN")) changed += database.deactivateInheritedBans(targetUuid, target);
+                final int count = changed;
+                database.insertAudit("UN" + type, targetUuid, target, modName, modDisplay, reason);
+                sync(() -> sender.sendMessage(PREFIX + (count > 0 ? "§aRemoved " + type.toLowerCase(Locale.ROOT) + " from §f" + target + "§a." : "§eNo active " + type.toLowerCase(Locale.ROOT) + " found for §f" + target + "§e.")));
+            } catch (Throwable t) { asyncError(sender, t); }
+        });
+    }
+
+    private void commandUnwarn(CommandSender sender, String[] args) {
+        if (args.length < 2) { sender.sendMessage(PREFIX + "§cUsage: /unwarn <user> <warning-id|all>"); return; }
+        String target = normalizeTarget(args[0]);
+        String id = args[1];
+        UUID targetUuid = knownUuid(target);
+        String modName = senderName(sender);
+        String modDisplay = moderatorDisplay(sender);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                int changed = id.equalsIgnoreCase("all") ? database.deactivate("WARN", targetUuid, target) : database.deactivateWarning(targetUuid, target, id);
+                if (changed > 0) database.insertAudit("UNWARN", targetUuid, target, modName, modDisplay, "Removed warning " + id);
+                sync(() -> sender.sendMessage(PREFIX + (changed > 0 ? "§aWarning removed." : "§eNo matching active warning found.")));
+            } catch (Throwable t) { asyncError(sender, t); }
+        });
+    }
+
+    private void submitPunishment(CommandSender sender, String type, String target, long duration, String reason) {
+        String moderatorName = senderName(sender);
+        String moderatorDisplay = moderatorDisplay(sender);
+        UUID modUuid = sender instanceof Player p ? p.getUniqueId() : null;
+        UUID targetUuid = knownUuid(target);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                long now = System.currentTimeMillis();
+                long expires;
+                if (type.equals("KICK")) expires = now;
+                else expires = duration < 0 ? 0L : duration == 0 ? now : safeAdd(now, duration);
+                boolean active = !type.equals("KICK");
+                Punishment p = new Punishment(UUID.randomUUID().toString(), type, targetUuid, target, modUuid, moderatorName, moderatorDisplay, reason, now, expires, active, null);
+                database.insertPunishment(p);
+                if (type.equals("KICK") || type.equals("WARN")) {
+                    String eventId = database.insertEvent("NETWORK_" + type, p.id);
+                    seenEventIds.add(eventId);
+                    seenEventTimes.put(eventId, now);
+                }
+                applyImmediate(p);
+                sync(() -> sender.sendMessage(PREFIX + "§a" + prettyType(type) + " applied to §f" + target + "§a" + (duration > 0 ? " for §f" + formatDuration(duration) : (duration < 0 && Set.of("BAN", "MUTE", "BLACKLIST", "WARN").contains(type)) ? " permanently" : "") + "."));
+            } catch (Throwable t) { asyncError(sender, t); }
+        });
+    }
+
+    private void applyImmediate(Punishment p) {
+        sync(() -> {
+            Player target = Bukkit.getPlayerExact(p.targetName);
+            if (target == null && p.targetUuid != null) target = Bukkit.getPlayer(p.targetUuid);
+            if (p.type.equals("BAN") || p.type.equals("BLACKLIST")) {
+                if (target != null) {
+                    captureCurrentPosition(target);
+                    captureEssentialsHomes(target);
+                    kickRich(target, p.type.equals("BAN") ? banMessage(p, false) : blacklistMessage(p, false));
+                } else if (p.targetUuid != null) {
+                    captureEssentialsHomes(p.targetUuid, p.targetName);
+                }
+            } else if (p.type.equals("KICK")) {
+                if (target != null) kickRich(target, kickMessage(p));
+            } else if (p.type.equals("MUTE")) {
+                if (target != null) muteCache.put(target.getUniqueId(), p);
+            } else if (p.type.equals("WARN")) {
+                if (target != null) {
+                    target.sendMessage("§e⚠ You were warned by a moderator. Type §f/warnings §eto view your warnings.");
+                }
+            }
+        });
+    }
+
+    private void networkTick() {
+        if (!ready) return;
+        long now = System.currentTimeMillis();
+        List<OnlineRef> online = new ArrayList<>();
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            try {
+                Location loc = p.getLocation();
+                World world = loc == null ? null : loc.getWorld();
+                if (loc != null && world != null) {
+                    online.add(new OnlineRef(p.getUniqueId(), p.getName(), world.getName(), loc.getX(), loc.getY(), loc.getZ()));
+                } else {
+                    online.add(new OnlineRef(p.getUniqueId(), p.getName(), "", 0, 0, 0));
+                }
+                Long lastHomes = lastHomeSnapshot.get(p.getUniqueId());
+                if (lastHomes == null || now - lastHomes >= HOME_REFRESH_MS) {
+                    lastHomeSnapshot.put(p.getUniqueId(), now);
+                    captureEssentialsHomes(p);
+                }
+            } catch (Throwable t) {
+                online.add(new OnlineRef(p.getUniqueId(), p.getName(), "", 0, 0, 0));
+            }
+        }
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> networkTickAsync(online));
+    }
+
+    private void networkTickAsync(List<OnlineRef> online) {
+        try {
+            long now = System.currentTimeMillis();
+            preLoginSnapshots.entrySet().removeIf(e -> now - e.getValue().loginAt > 120_000L);
+            if (now - lastSettingsRefresh > 10_000L) {
+                settings = Settings.load(database);
+                lastSettingsRefresh = now;
+            }
+            if (now - lastCleanup > 60_000L) {
+                database.cleanupExpired(now);
+                lastCleanup = now;
+            }
+            List<Punishment> active = database.getAllActiveNetwork(now);
+            Map<String, Punishment> byUuid = new HashMap<>();
+            Map<String, Punishment> byName = new HashMap<>();
+            for (Punishment p : active) {
+                if (p.targetUuid != null) byUuid.merge(p.targetUuid.toString(), p, WorldsGreatestModeration::stronger);
+                byName.merge(p.targetKey(), p, WorldsGreatestModeration::stronger);
+            }
+            Map<UUID, Punishment> newMutes = new HashMap<>();
+            List<KickPlan> kicks = new ArrayList<>();
+            for (OnlineRef ref : online) {
+                Punishment p = byUuid.get(ref.uuid.toString());
+                if (p == null) p = byName.get(ref.name.toLowerCase(Locale.ROOT));
+                if (p == null) continue;
+                if (p.type.equals("BLACKLIST") || p.type.equals("BAN")) {
+                    kicks.add(new KickPlan(ref.uuid, p.type.equals("BLACKLIST") ? blacklistMessage(p, false) : banMessage(p, false)));
+                } else if (p.type.equals("MUTE")) {
+                    newMutes.put(ref.uuid, p);
+                }
+            }
+            Set<UUID> onlineIds = new HashSet<>(); for (OnlineRef ref : online) onlineIds.add(ref.uuid);
+            for (UUID id : onlineIds) {
+                Punishment mute = newMutes.get(id);
+                if (mute == null) muteCache.remove(id); else muteCache.put(id, mute);
+            }
+            if (!kicks.isEmpty()) sync(() -> {
+                for (KickPlan plan : kicks) {
+                    Player player = Bukkit.getPlayer(plan.uuid);
+                    if (player != null) kickRich(player, plan.message);
+                }
+            });
+            if (settings.behaviorWatchEnabled && now - lastBehaviorSample >= BEHAVIOR_SAMPLE_MS) {
+                lastBehaviorSample = now;
+                recordAndEvaluateBehavior(online, active, now);
+            }
+            pollAltAlerts(now);
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "Network moderation refresh failed", t);
+        }
+    }
+
+    private static Punishment stronger(Punishment a, Punishment b) {
+        return rank(a.type) >= rank(b.type) ? a : b;
+    }
+
+    private static int rank(String type) {
+        return switch (type) { case "BLACKLIST" -> 4; case "BAN" -> 3; case "MUTE" -> 2; default -> 1; };
+    }
+
+    private void pollAltAlerts(long now) throws SQLException {
+        for (ModEvent e : database.eventsSince(now - 10_000L)) {
+            if (!seenEventIds.add(e.id)) continue;
+            seenEventTimes.put(e.id, now);
+            if (e.type.equals("ALT_ACTION") || e.type.equals("ALT_SUSPECT")) {
+                boolean suspect = e.type.equals("ALT_SUSPECT");
+                sync(() -> {
+                    for (Player p : Bukkit.getOnlinePlayers()) {
+                        if (shouldReceiveAlert(p)) p.sendMessage(PREFIX + (suspect ? "§6§lALT REVIEW " : "§c§lALT DETECTION ") + "§8• §f" + e.payload.replace("|", " §8• §f"));
+                    }
+                });
+            } else if (e.type.equals("NETWORK_KICK") || e.type.equals("NETWORK_WARN")) {
+                Punishment action = database.findPunishmentById(e.payload);
+                if (action != null) applyImmediate(action);
+            }
+        }
+        if (seenEventIds.size() > 2000) {
+            for (Map.Entry<String, Long> e : new ArrayList<>(seenEventTimes.entrySet())) {
+                if (now - e.getValue() > 60_000L) { seenEventIds.remove(e.getKey()); seenEventTimes.remove(e.getKey()); }
+            }
+        }
+    }
+
+    private AltDecision evaluateAlt(UUID altUuid, String altName, String ipHash, String networkHash, String fingerprint, String clientTokenHash,
+                                    boolean preLogin, boolean knownBeforeLogin, long loginAt, String addressScope, boolean forwarded) throws SQLException {
+        if (settings.altMode.equals("OFF") || altUuid == null) return null;
