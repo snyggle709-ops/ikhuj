@@ -1,0 +1,266 @@
+            getLogger().log(Level.WARNING, "Could not rename the obsolete local blacklist file. It is still ignored by this version and cannot block logins.", e);
+        }
+    }
+
+    private void appendLog(String text) {
+        if (detectionLog == null) return;
+        String line = Instant.now() + " " + text + System.lineSeparator();
+        try {
+            Files.writeString(detectionLog.toPath(), line, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            getLogger().log(Level.WARNING, "Could not append ItemGuard detection log", e);
+        }
+    }
+
+    /* ----------------------------- reflection helpers ----------------------------- */
+
+    private static Method findMethod(Class<?> type, String name, int arity) {
+        List<Method> methods = candidateMethods(type, name, arity);
+        return methods.isEmpty() ? null : methods.get(0);
+    }
+
+    /**
+     * Reflection is only retained for Paper/Bukkit APIs that vary across 1.21.x builds.
+     * The old implementation recursively walked every interface and called Class#getMethods()
+     * on every single inspection. That was the dominant Spark cost. Resolutions are now cached
+     * per runtime class/name/arity for the lifetime of the plugin.
+     */
+    private static List<Method> candidateMethods(Class<?> type, String name, int arity) {
+        if (type == null) return Collections.emptyList();
+        MethodKey key = new MethodKey(type, name, arity);
+        List<Method> cached = METHOD_CACHE.get(key);
+        if (cached != null) {
+            reflectionCacheHits.incrementAndGet();
+            return cached;
+        }
+        reflectionCacheMisses.incrementAndGet();
+        List<Method> resolved = resolveCandidateMethods(type, name, arity);
+        List<Method> previous = METHOD_CACHE.putIfAbsent(key, resolved);
+        return previous == null ? resolved : previous;
+    }
+
+    private static List<Method> resolveCandidateMethods(Class<?> type, String name, int arity) {
+        LinkedHashSet<Method> out = new LinkedHashSet<>();
+        collectInterfaceMethods(type, name, arity, out, new LinkedHashSet<>());
+        try {
+            for (Method m : type.getMethods()) {
+                if (m.getName().equals(name) && m.getParameterCount() == arity) out.add(m);
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return Collections.unmodifiableList(new ArrayList<>(out));
+    }
+
+    private static void collectInterfaceMethods(Class<?> type, String name, int arity, Set<Method> out, Set<Class<?>> seen) {
+        if (type == null || !seen.add(type)) return;
+        try {
+            for (Class<?> iface : type.getInterfaces()) {
+                for (Method m : iface.getMethods()) {
+                    if (m.getName().equals(name) && m.getParameterCount() == arity) out.add(m);
+                }
+                collectInterfaceMethods(iface, name, arity, out, seen);
+            }
+            collectInterfaceMethods(type.getSuperclass(), name, arity, out, seen);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private static CallResult callResult(Object target, String name, Object... args) {
+        if (target == null) return CallResult.missing();
+        boolean found = false;
+        Throwable failure = null;
+        for (Method m : candidateMethods(target.getClass(), name, args.length)) {
+            Class<?>[] params = m.getParameterTypes();
+            boolean compatible = true;
+            for (int i = 0; i < params.length; i++) {
+                if (!compatible(params[i], args[i])) { compatible = false; break; }
+            }
+            if (!compatible) continue;
+            found = true;
+            try {
+                reflectiveInvocations.incrementAndGet();
+                return CallResult.success(m.invoke(target, args));
+            } catch (IllegalAccessException e) {
+                failure = e;
+            } catch (InvocationTargetException e) {
+                return CallResult.failure(e.getCause() == null ? e : e.getCause());
+            } catch (RuntimeException e) {
+                failure = e;
+            }
+        }
+        return found ? CallResult.failure(failure) : CallResult.missing();
+    }
+
+    private static Object callQuiet(Object target, String name, Object... args) {
+        CallResult r = callResult(target, name, args);
+        return r.ok ? r.value : null;
+    }
+
+    private static Object invokeMethodQuiet(Object target, Method method, Object... args) {
+        if (target == null || method == null) return null;
+        try {
+            reflectiveInvocations.incrementAndGet();
+            return method.invoke(target, args);
+        } catch (IllegalAccessException e) {
+            CallResult r = callResult(target, method.getName(), args);
+            return r.ok ? r.value : null;
+        } catch (InvocationTargetException | RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static boolean compatible(Class<?> param, Object arg) {
+        if (arg == null) return !param.isPrimitive();
+        if (!param.isPrimitive()) return param.isAssignableFrom(arg.getClass());
+        return (param == boolean.class && arg instanceof Boolean) ||
+                (param == int.class && arg instanceof Integer) ||
+                (param == long.class && arg instanceof Long) ||
+                (param == double.class && arg instanceof Double) ||
+                (param == float.class && arg instanceof Float) ||
+                (param == byte.class && arg instanceof Byte) ||
+                (param == short.class && arg instanceof Short) ||
+                (param == char.class && arg instanceof Character);
+    }
+
+    private static Object enumConstant(String className, String constant) {
+        try {
+            Class<?> c = Class.forName(className);
+            if (!c.isEnum()) return null;
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Object value = Enum.valueOf((Class<? extends Enum>) c.asSubclass(Enum.class), constant);
+            return value;
+        } catch (Throwable ignored) { return null; }
+    }
+
+    private static Player asPlayer(Object o) { return o instanceof Player ? (Player) o : null; }
+    private static ItemStack asItem(Object o) { return o instanceof ItemStack ? (ItemStack) o : null; }
+    private static Inventory asInventory(Object o) { return o instanceof Inventory ? (Inventory) o : null; }
+    private static UUID asUuid(Object o) { return o instanceof UUID ? (UUID) o : null; }
+    private static String asString(Object o) { return o == null ? null : String.valueOf(o); }
+    private static int intValue(Object o, int fallback) { return o instanceof Number ? ((Number) o).intValue() : fallback; }
+    private static double doubleValue(Object o, double fallback) { return o instanceof Number ? ((Number) o).doubleValue() : fallback; }
+    private static boolean booleanValue(Object o, boolean fallback) { return o instanceof Boolean ? (Boolean) o : fallback; }
+
+    private static String safeType(ItemStack stack) {
+        try { return stack == null || stack.getType() == null ? "UNKNOWN" : stack.getType().name(); }
+        catch (Throwable ignored) { return "UNKNOWN"; }
+    }
+
+    private static String safeName(Player p) {
+        try { return p == null ? "unknown" : p.getName(); }
+        catch (Throwable ignored) { return "unknown"; }
+    }
+
+    private static String safeKey(Object keyed) {
+        if (keyed == null) return "unknown";
+        Object key = callQuiet(keyed, "getKey");
+        if (key != null) return String.valueOf(key);
+        return String.valueOf(keyed);
+    }
+
+    private static String shortReasons(Collection<String> reasons) {
+        String joined = String.join(", ", reasons);
+        return joined.length() <= 160 ? joined : joined.substring(0, 157) + "...";
+    }
+
+    private static String compactPath(String path) {
+        return path.length() <= 80 ? path : "..." + path.substring(path.length() - 77);
+    }
+
+    /* ----------------------------- value classes ----------------------------- */
+
+    private static final class MethodKey {
+        final Class<?> type;
+        final String name;
+        final int arity;
+        MethodKey(Class<?> type, String name, int arity) {
+            this.type = type; this.name = name; this.arity = arity;
+        }
+        @Override public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof MethodKey)) return false;
+            MethodKey other = (MethodKey) o;
+            return type == other.type && arity == other.arity && name.equals(other.name);
+        }
+        @Override public int hashCode() {
+            int h = System.identityHashCode(type);
+            h = 31 * h + name.hashCode();
+            return 31 * h + arity;
+        }
+    }
+
+    private static final class PendingScan {
+        volatile boolean force;
+        volatile String source;
+        PendingScan(boolean force, String source) { this.force = force; this.source = source; }
+    }
+
+    private static final class CallResult {
+        final boolean exists;
+        final boolean ok;
+        final Object value;
+        final Throwable failure;
+        private CallResult(boolean exists, boolean ok, Object value, Throwable failure) {
+            this.exists = exists; this.ok = ok; this.value = value; this.failure = failure;
+        }
+        static CallResult missing() { return new CallResult(false, false, null, null); }
+        static CallResult success(Object value) { return new CallResult(true, true, value, null); }
+        static CallResult failure(Throwable t) { return new CallResult(true, false, null, t); }
+    }
+
+    private static final class Inspection {
+        final String itemType;
+        final LinkedHashSet<String> reasons = new LinkedHashSet<>();
+        int serializedBytes = -1;
+        Inspection(String itemType) { this.itemType = itemType; }
+        void add(String reason) { if (reason != null && reasons.size() < 20) reasons.add(reason); }
+        boolean dangerous() { return !reasons.isEmpty(); }
+    }
+
+    private static final class SlotCache {
+        final int[] hashes;
+        volatile long lastForcedScanNanos;
+        SlotCache(int size) { this.hashes = new int[Math.max(0, size)]; }
+    }
+
+    private static final class GuardConfig {
+        long scanPeriodTicks = 5L;
+        int periodicPlayersPerCycle = 2;
+        long forceRescanTicks = 1200L;
+        int maxSerializedBytes = 2 * 1024 * 1024;
+        int maxDataComponents = 48;
+        int maxItemRecursionDepth = 6;
+        int maxObjectGraphDepth = 14;
+        int maxReasonsPerItem = 20;
+        int maxMapEntries = 512;
+        int maxMapEntriesHardWalk = 1024;
+        int maxCollectionEntries = 512;
+        int maxCollectionWalk = 1024;
+        int maxGenericStringChars = 32768;
+        int maxDisplayNameChars = 1024;
+        int maxLoreLines = 128;
+        int maxLoreLineChars = 4096;
+        int maxBookPages = 100;
+        int maxBookPageChars = 8192;
+        int maxBookTotalChars = 131072;
+        int maxBookTitleChars = 1024;
+        int maxBookAuthorChars = 1024;
+        int maxEnchantments = 32;
+        int maxAttributeModifiers = 32;
+        double maxAttributeAbsoluteAmount = 1024D;
+        int maxCustomPotionEffects = 16;
+        int maxCustomPotionAmplifier = 5;
+        int maxCustomPotionDurationTicks = 20 * 60 * 60 * 24 * 7;
+        int maxFireworkPower = 3;
+        int maxFireworkEffects = 7;
+        int maxFireworkColorsPerEffect = 32;
+        int maxBannerPatterns = 32;
+        int maxContainerEntries = 64;
+        boolean blockUnbreakable = true;
+        boolean blockCustomMaxStack = true;
+        boolean checkEnchantmentLevels = true;
+        boolean checkEnchantmentConflicts = true;
+        boolean blockEmbeddedSpawnEggEntityData = true;
+        boolean sanitizeOpenedContainers = true;
+
+        static GuardConfig load(File file, java.util.logging.Logger logger) {
