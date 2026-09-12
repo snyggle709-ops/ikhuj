@@ -1,0 +1,241 @@
+package com.cesiummc.itemguard;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.enchantments.Enchantment;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityPickupItemEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.inventory.CraftItemEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryCreativeEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerItemConsumeEvent;
+import org.bukkit.event.player.PlayerItemHeldEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerSwapHandItemsEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+
+/**
+ * CesiumItemGuard - strict illegal/malicious item defense for Paper/Leaf 1.21.4.
+ *
+ * Enforcement deliberately has no permission/OP bypass. Plugin commands are hard-gated
+ * to the exact player name "toes__"; that command gate is NOT an enforcement bypass.
+ */
+public final class CesiumItemGuard extends JavaPlugin implements Listener {
+    private static final String OWNER_NAME = "toes__";
+    private static final String BLACKLIST_REASON = "Item Exploits";
+    private static final Object MISSING = new Object();
+
+    private final Set<UUID> enforcementInProgress = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, SlotCache> scanCache = new ConcurrentHashMap<>();
+    private final Map<UUID, PendingScan> pendingScans = new ConcurrentHashMap<>();
+    private final AtomicLong detections = new AtomicLong();
+    private final AtomicLong sanitizedContainers = new AtomicLong();
+    private final AtomicLong scanRequests = new AtomicLong();
+    private final AtomicLong coalescedScanRequests = new AtomicLong();
+    private final AtomicLong playerScans = new AtomicLong();
+    private final AtomicLong slotsVisited = new AtomicLong();
+    private final AtomicLong itemsInspected = new AtomicLong();
+    private static final AtomicLong reflectionCacheHits = new AtomicLong();
+    private static final AtomicLong reflectionCacheMisses = new AtomicLong();
+    private static final AtomicLong reflectiveInvocations = new AtomicLong();
+    private static final Map<MethodKey, List<Method>> METHOD_CACHE = new ConcurrentHashMap<>();
+    private int periodicCursor = 0;
+
+    private GuardConfig cfg;
+    private File detectionLog;
+
+    @Override
+    public void onEnable() {
+        if (!getDataFolder().exists() && !getDataFolder().mkdirs()) {
+            getLogger().warning("Could not create plugin data directory; continuing with in-memory enforcement.");
+        }
+        this.detectionLog = new File(getDataFolder(), "detections.log");
+        this.cfg = GuardConfig.load(new File(getDataFolder(), "config.properties"), getLogger());
+        disableLegacyLocalBlacklist();
+
+        getServer().getPluginManager().registerEvents(this, this);
+        long period = Math.max(1L, cfg.scanPeriodTicks);
+        getServer().getScheduler().runTaskTimer(this, this::periodicScan, 20L, period);
+
+        Plugin wgm = getServer().getPluginManager().getPlugin("WorldsGreatestModeration");
+        if (wgm == null) {
+            getLogger().severe("WorldsGreatestModeration was not detected. ItemGuard cannot apply moderation punishments without WGM.");
+        }
+        getLogger().info("CesiumItemGuard 1.0.3 enabled with cached reflection + coalesced/staggered scanning. Enforcement bypasses: none. Command controller: " + OWNER_NAME + ".");
+    }
+
+    @Override
+    public void onDisable() {
+        try {
+            getServer().getScheduler().cancelTasks(this);
+        } catch (Throwable ignored) {
+        }
+        pendingScans.clear();
+        scanCache.clear();
+        METHOD_CACHE.clear();
+    }
+
+    /* ----------------------------- hard command gate ----------------------------- */
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!(sender instanceof Player) || !OWNER_NAME.equalsIgnoreCase(sender.getName())) {
+            sender.sendMessage("Unknown command. Type /help for help.");
+            return true;
+        }
+        Player player = (Player) sender;
+        String sub = args.length == 0 ? "status" : args[0].toLowerCase(Locale.ROOT);
+        switch (sub) {
+            case "status":
+                player.sendMessage("§8§m--------------------------------");
+                player.sendMessage("§b§lCesiumItemGuard §7status");
+                player.sendMessage("§7Detections this boot: §f" + detections.get());
+                player.sendMessage("§7Sanitized container items: §f" + sanitizedContainers.get());
+                player.sendMessage("§7Punishment backend: §fWorldsGreatestModeration only");
+                player.sendMessage("§7Periodic scan cycle: §f" + cfg.scanPeriodTicks + " ticks §8(§f" + cfg.periodicPlayersPerCycle + " players/cycle§8)");
+                player.sendMessage("§7Forced full rescan: §f" + cfg.forceRescanTicks + " ticks/player");
+                player.sendMessage("§7Scans executed this boot: §f" + playerScans.get() + " §8(§7requests " + scanRequests.get() + ", coalesced " + coalescedScanRequests.get() + "§8)");
+                player.sendMessage("§7Slots visited / items inspected: §f" + slotsVisited.get() + " §8/ §f" + itemsInspected.get());
+                player.sendMessage("§7Reflection cache: §f" + METHOD_CACHE.size() + " methods §8(§7hits " + reflectionCacheHits.get() + ", misses " + reflectionCacheMisses.get() + "§8)");
+                player.sendMessage("§7WGM integration: " + (hasWgm() ? "§aCONNECTED" : "§cNOT FOUND"));
+                player.sendMessage("§7Enforcement bypasses: §cNONE");
+                player.sendMessage("§8§m--------------------------------");
+                return true;
+            case "reload":
+                this.cfg = GuardConfig.load(new File(getDataFolder(), "config.properties"), getLogger());
+                player.sendMessage("§aCesiumItemGuard configuration reloaded. Restart to change the repeating scan interval already scheduled for this boot.");
+                return true;
+            case "scan": {
+                Player target = player;
+                if (args.length >= 2) {
+                    Player found = Bukkit.getPlayerExact(args[1]);
+                    if (found == null) {
+                        player.sendMessage("§cThat player is not online.");
+                        return true;
+                    }
+                    target = found;
+                }
+                boolean hit = scanPlayer(target, "manual-scan", true);
+                player.sendMessage(hit ? "§cExploit item detected and enforcement triggered." : "§aNo exploit items detected in " + target.getName() + "'s inventory.");
+                return true;
+            }
+            case "inspect": {
+                Object hand = callQuiet(player.getInventory(), "getItemInMainHand");
+                if (!(hand instanceof ItemStack)) {
+                    player.sendMessage("§7No item in your main hand.");
+                    return true;
+                }
+                Inspection inspection = inspect((ItemStack) hand);
+                if (!inspection.dangerous()) {
+                    player.sendMessage("§aHeld item passed all enabled checks. Serialized size: §f" + inspection.serializedBytes + " bytes§a.");
+                } else {
+                    player.sendMessage("§cHeld item is prohibited: §f" + String.join("; ", inspection.reasons));
+                    removeMatchingDangerousItems(player, "inspect");
+                    enforce(player, inspection, "manual-inspect");
+                }
+                return true;
+            }
+            case "help":
+            default:
+                player.sendMessage("§b/itemguard status §7- current guard status");
+                player.sendMessage("§b/itemguard scan [player] §7- force a deep inventory scan");
+                player.sendMessage("§b/itemguard inspect §7- inspect your main-hand item");
+                player.sendMessage("§b/itemguard reload §7- reload thresholds");
+                return true;
+        }
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        if (!(sender instanceof Player) || !OWNER_NAME.equalsIgnoreCase(sender.getName())) return Collections.emptyList();
+        if (args.length == 1) {
+            List<String> out = new ArrayList<>();
+            String p = args[0].toLowerCase(Locale.ROOT);
+            for (String s : new String[]{"status", "scan", "inspect", "reload", "help"}) if (s.startsWith(p)) out.add(s);
+            return out;
+        }
+        if (args.length == 2 && "scan".equalsIgnoreCase(args[0])) {
+            List<String> out = new ArrayList<>();
+            for (Player p : Bukkit.getOnlinePlayers()) if (p.getName().toLowerCase(Locale.ROOT).startsWith(args[1].toLowerCase(Locale.ROOT))) out.add(p.getName());
+            return out;
+        }
+        return Collections.emptyList();
+    }
+
+    /* ----------------------------- event interception ----------------------------- */
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onJoin(PlayerJoinEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        if (p != null) scheduleScan(p, "join", true, 1L);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onCommandPreprocess(PlayerCommandPreprocessEvent event) {
+        Player p = asPlayer(callQuiet(event, "getPlayer"));
+        if (p != null) scheduleScan(p, "command", false, 1L);
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onCreative(InventoryCreativeEvent event) {
+        Player p = asPlayer(callQuiet(event, "getWhoClicked"));
+        ItemStack cursor = asItem(callQuiet(event, "getCursor"));
+        if (p != null && cursor != null) {
+            Inspection result = inspect(cursor);
+            if (result.dangerous()) {
+                callQuiet(event, "setCancelled", true);
+                callQuiet(event, "setCursor", (Object) null);
+                enforce(p, result, "creative-injection");
+                return;
+            }
+        }
+        if (p != null) scheduleScan(p, "creative", false, 1L);
