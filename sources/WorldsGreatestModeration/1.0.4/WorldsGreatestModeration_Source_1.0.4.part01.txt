@@ -1,0 +1,227 @@
+            rtpPendingUntil.put(sender.getUniqueId(), now + 30_000L);
+            rtpLandings.remove(sender.getUniqueId());
+            resetDwellFor(sender.getUniqueId());
+            return;
+        }
+
+        UUID recipient = null;
+        if (Set.of("msg", "tell", "w", "whisper", "m", "pm", "message", "emsg", "etell", "ewhisper").contains(label) && parts.length >= 2) {
+            Player target = Bukkit.getPlayerExact(parts[1]);
+            if (target != null && !target.getUniqueId().equals(sender.getUniqueId())) recipient = target.getUniqueId();
+        } else if (Set.of("r", "reply", "er", "ereply").contains(label)) {
+            UUID partner = lastPmPartner.get(sender.getUniqueId());
+            if (partner != null && Bukkit.getPlayer(partner) != null) recipient = partner;
+        }
+
+        if (recipient == null) return;
+        UUID from = sender.getUniqueId();
+        UUID to = recipient;
+        lastPmPartner.put(from, to);
+        lastPmPartner.put(to, from);
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try { database.recordMessageEdge(from, to, now); }
+            catch (Throwable t) { getLogger().log(Level.FINE, "Could not record private-message contact edge", t); }
+        });
+    }
+
+    private void resetDwellFor(UUID suspect) {
+        if (suspect == null) return;
+        String prefix = suspect + "|";
+        dwellStates.keySet().removeIf(k -> k.startsWith(prefix));
+    }
+
+    private void captureEssentialsHomes(Player player) {
+        if (player == null) return;
+        captureEssentialsHomes(player.getUniqueId(), player.getName());
+    }
+
+    private void captureEssentialsHomes(UUID uuid, String displayName) {
+        if (uuid == null || database == null) return;
+        try {
+            Plugin essentials = Bukkit.getPluginManager().getPlugin("Essentials");
+            if (essentials == null) return;
+            Method getUser = essentials.getClass().getMethod("getUser", UUID.class);
+            Object user = getUser.invoke(essentials, uuid);
+            if (user == null) return;
+
+            List<HomePoint> points = new ArrayList<>();
+            try {
+                Object homesObj = user.getClass().getMethod("getHomes").invoke(user);
+                if (homesObj instanceof Iterable<?> homes) {
+                    Method getHome = user.getClass().getMethod("getHome", String.class);
+                    for (Object rawName : homes) {
+                        if (rawName == null) continue;
+                        String homeName = String.valueOf(rawName);
+                        Object locObj;
+                        try { locObj = getHome.invoke(user, homeName); }
+                        catch (Throwable ignored) { continue; }
+                        if (!(locObj instanceof Location loc) || loc.getWorld() == null) continue;
+                        String world = loc.getWorld().getName();
+                        if (isWatchExcludedWorld(world)) continue;
+                        points.add(new HomePoint(homeName, world, loc.getX(), loc.getY(), loc.getZ()));
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            BasePoint lastKnown = null;
+            if (Bukkit.getPlayer(uuid) == null) {
+                for (String methodName : List.of("getLogoutLocation", "getLastLocation")) {
+                    try {
+                        Object locObj = user.getClass().getMethod(methodName).invoke(user);
+                        if (locObj instanceof Location loc && loc.getWorld() != null && !isWatchExcludedWorld(loc.getWorld().getName())) {
+                            lastKnown = new BasePoint("LAST", loc.getWorld().getName(), loc.getX(), loc.getY(), loc.getZ(), System.currentTimeMillis());
+                            break;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+
+            if (points.isEmpty() && lastKnown == null) return;
+            final BasePoint capturedLast = lastKnown;
+            Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+                try {
+                    long now = System.currentTimeMillis();
+                    for (HomePoint point : points) database.observeHome(uuid, point, now);
+                    if (capturedLast != null) database.observeHistoricalLastPosition(uuid, displayName == null ? uuid.toString() : displayName, capturedLast, now);
+                } catch (Throwable t) {
+                    getLogger().log(Level.FINE, "Could not snapshot Essentials data for " + displayName, t);
+                }
+            });
+        } catch (NoSuchMethodException ignored) {
+            // Essentials is absent or its API is not the expected EssentialsX API. Heat-map fallback remains active.
+        } catch (Throwable t) {
+            getLogger().log(Level.FINE, "Could not read Essentials data for " + displayName, t);
+        }
+    }
+
+    private void captureCurrentPosition(Player player) {
+        if (player == null) return;
+        try {
+            Location loc = player.getLocation();
+            if (loc == null || loc.getWorld() == null || isWatchExcludedWorld(loc.getWorld().getName())) return;
+            OnlineRef ref = new OnlineRef(player.getUniqueId(), player.getName(), loc.getWorld().getName(), loc.getX(), loc.getY(), loc.getZ());
+            Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+                try { database.observeExplicitLastPosition(ref, System.currentTimeMillis()); }
+                catch (Throwable t) { getLogger().log(Level.FINE, "Could not save punishment-time position for " + player.getName(), t); }
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    private void backfillPunishedEssentialsLocations() {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                List<Punishment> active = database.getAllActiveNetwork(System.currentTimeMillis());
+                Map<UUID,String> targets = new LinkedHashMap<>();
+                for (Punishment p : active) {
+                    if (!Set.of("BAN","BLACKLIST").contains(p.type)) continue;
+                    Punishment root = database.resolveRootPunishment(p);
+                    if (root != null && root.targetUuid != null) targets.putIfAbsent(root.targetUuid, root.targetName);
+                }
+                sync(() -> {
+                    for (Map.Entry<UUID,String> e : targets.entrySet()) captureEssentialsHomes(e.getKey(), e.getValue());
+                });
+            } catch (Throwable t) {
+                getLogger().log(Level.FINE, "Could not backfill Essentials locations for punished accounts", t);
+            }
+        });
+    }
+
+    private void checkAccountAgeGate(UUID uuid, String name) {
+        if (!ready || uuid == null || !settings.accountAgeGate) return;
+        // Offline standalone UUIDs are not Mojang account UUIDs. Never age-gate those.
+        if (serverOfflineMode && !proxyForwardingConfigured) return;
+        if (!accountAgeChecksInFlight.add(uuid)) return;
+
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                long now = System.currentTimeMillis();
+                AccountAgeInfo cached = database.accountAgeInfo(uuid);
+                if (cached != null) {
+                    if ("CONFIRMED".equals(cached.status) && cached.createdAt != null) {
+                        applyAccountAgeResult(uuid, name, cached.createdAt, now);
+                        return;
+                    }
+                    if (now - cached.checkedAt < 6L * 60L * 60L * 1000L) return;
+                }
+
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create("https://api.ashcon.app/mojang/v2/user/" + uuid))
+                        .timeout(Duration.ofSeconds(5))
+                        .header("User-Agent", "WorldsGreatestModeration/1.0.4")
+                        .GET()
+                        .build();
+                HttpResponse<String> response = accountAgeHttp.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                if (response.statusCode() != 200) {
+                    database.storeAccountAge(uuid, null, now, "UNKNOWN");
+                    return;
+                }
+                String body = response.body();
+                Matcher uuidMatcher = ASHCON_UUID.matcher(body);
+                Matcher createdMatcher = ASHCON_CREATED_AT.matcher(body);
+                if (!uuidMatcher.find() || !createdMatcher.find()) {
+                    database.storeAccountAge(uuid, null, now, "UNKNOWN");
+                    return;
+                }
+                String returned = uuidMatcher.group(1).replace("-", "");
+                String expected = uuid.toString().replace("-", "");
+                if (!returned.equalsIgnoreCase(expected)) {
+                    database.storeAccountAge(uuid, null, now, "UNKNOWN");
+                    return;
+                }
+
+                long createdAt;
+                try { createdAt = Instant.parse(createdMatcher.group(1)).toEpochMilli(); }
+                catch (Throwable parseFailure) {
+                    database.storeAccountAge(uuid, null, now, "UNKNOWN");
+                    return;
+                }
+                if (createdAt <= 0L || createdAt > now + 5L * 60L * 1000L) {
+                    database.storeAccountAge(uuid, null, now, "UNKNOWN");
+                    return;
+                }
+                database.storeAccountAge(uuid, createdAt, now, "CONFIRMED");
+                applyAccountAgeResult(uuid, name, createdAt, now);
+            } catch (Throwable t) {
+                try { database.storeAccountAge(uuid, null, System.currentTimeMillis(), "UNKNOWN"); } catch (Throwable ignored) {}
+                getLogger().log(Level.FINE, "Account age lookup failed open for " + name, t);
+            } finally {
+                accountAgeChecksInFlight.remove(uuid);
+            }
+        });
+    }
+
+    private void applyAccountAgeResult(UUID uuid, String name, long createdAt, long now) {
+        long age = now - createdAt;
+        if (age >= ACCOUNT_AGE_MIN_MS) return;
+        long remaining = ACCOUNT_AGE_MIN_MS - Math.max(0L, age);
+        try {
+            database.insertEvent("AGE_GATE", name + "|" + uuid + "|confirmed account age " + formatDuration(Math.max(0L, age)) + "|retry in " + formatDuration(remaining));
+        } catch (Throwable ignored) {}
+        String message = "§cYour Minecraft account must be at least §f2 days old §cto join §f" + settings.serverName + "§c.\n"
+                + "§7This account has not reached the 48-hour minimum yet.\n"
+                + "§7Try again in approximately §f" + formatDuration(remaining) + "§7.";
+        kickByIdSync(uuid, message);
+    }
+
+    private boolean isWatchExcludedWorld(String world) {
+        return world == null || world.isBlank() || settings.watchExcludedWorlds.contains(world.toLowerCase(Locale.ROOT));
+    }
+
+    private void recordAndEvaluateBehavior(List<OnlineRef> online, List<Punishment> active, long now) throws SQLException {
+        database.recordPresenceBatch(online, now, settings.watchExcludedWorlds);
+
+        Map<UUID, Punishment> roots = new LinkedHashMap<>();
+        for (Punishment sanction : active) {
+            if (!Set.of("BAN", "BLACKLIST").contains(sanction.type)) continue;
+            Punishment root = database.resolveRootPunishment(sanction);
+            if (root == null || root.targetUuid == null) continue;
+            roots.putIfAbsent(root.targetUuid, root);
+        }
+        if (roots.isEmpty()) return;
+
+        Map<UUID, BehaviorProfile> profiles = new HashMap<>();
+        for (Map.Entry<UUID, Punishment> e : roots.entrySet()) {
+            UUID rootUuid = e.getKey();
+            Punishment root = e.getValue();
+            List<BasePoint> anchors = database.behaviorAnchors(rootUuid, settings.watchExcludedWorlds);
+            List<ContactStat> contacts = database.topContacts(rootUuid, 5);
