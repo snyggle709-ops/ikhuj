@@ -1,0 +1,450 @@
+===== plugin.yml =====
+name: CesiumDaily
+version: 1.0.0
+main: com.cesiummc.daily.CesiumDaily
+api-version: '1.21'
+load: POSTWORLD
+commands:
+  daily:
+    description: Claim and use the Daily Crate or open its OP-only configuration GUI.
+    usage: /daily [config|rewards]
+
+===== src/com/cesiummc/daily/CesiumDaily.java =====
+package com.cesiummc.daily;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
+import org.bukkit.Particle;
+import org.bukkit.World;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.persistence.PersistentDataContainer;
+import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
+
+import java.io.File;
+import java.io.IOException;
+import java.text.DecimalFormat;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.logging.Level;
+
+public final class CesiumDaily extends JavaPlugin implements Listener {
+    private static final String PREFIX = "§8[§6Daily§8] §r";
+    private static final String GUI_MAIN = "§6§lDaily Crate §8• §fConfig";
+    private static final String GUI_REWARDS = "§6§lDaily Crate §8• §fRewards";
+    private static final String GUI_REWARD_EDIT = "§6§lDaily Crate §8• §fEdit Reward";
+    private static final String GUI_PREVIEW = "§6§lDaily Crate §8• §fPossible Rewards";
+    private static final String GUI_ROLL = "§6§lDaily Crate §8• §eRolling...";
+    private static final int[] WEIGHTS = {1, 2, 3, 5, 8, 12, 20, 35, 50, 75, 100};
+    private static final long HOUR = 3_600_000L;
+
+    private final List<Reward> rewards = new ArrayList<>();
+    private final Map<UUID, Long> claims = new HashMap<>();
+    private final Map<UUID, RollSession> rolling = new HashMap<>();
+    private final DecimalFormat chanceFormat = new DecimalFormat("0.##");
+
+    private File settingsFile;
+    private File rewardsFile;
+    private File claimsFile;
+    private YamlConfiguration settingsYaml;
+    private YamlConfiguration rewardsYaml;
+    private YamlConfiguration claimsYaml;
+    private Settings settings;
+    private NamespacedKey crateKey;
+
+    @Override
+    public void onEnable() {
+        if (!getDataFolder().exists() && !getDataFolder().mkdirs()) {
+            getLogger().warning("Could not create plugin data folder.");
+        }
+        crateKey = new NamespacedKey(this, "daily_crate");
+        settingsFile = new File(getDataFolder(), "settings.yml");
+        rewardsFile = new File(getDataFolder(), "rewards.yml");
+        claimsFile = new File(getDataFolder(), "claims.yml");
+        loadAll();
+        getServer().getPluginManager().registerEvents(this, this);
+        getLogger().info("CesiumDaily enabled with " + rewards.size() + " configured rewards.");
+    }
+
+    @Override
+    public void onDisable() {
+        saveClaims();
+        saveRewards();
+        saveSettings();
+        for (RollSession session : new ArrayList<>(rolling.values())) {
+            try { session.task.cancel(); } catch (Throwable ignored) { }
+            if (!session.awarded) award(session.player, session.reward, true);
+        }
+        rolling.clear();
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!command.getName().equalsIgnoreCase("daily")) return false;
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "§cThis command is player-only because configuration is GUI based.");
+            return true;
+        }
+
+        if (args.length > 0 && args[0].equalsIgnoreCase("config")) {
+            if (!player.isOp()) {
+                player.sendMessage(PREFIX + "§cOnly server operators can edit Daily Crate configuration.");
+                play(player, "entity.villager.no", 0.8f, 0.8f);
+                return true;
+            }
+            openMainConfig(player);
+            return true;
+        }
+
+        if (args.length > 0 && (args[0].equalsIgnoreCase("rewards") || args[0].equalsIgnoreCase("preview"))) {
+            openRewardPreview(player, 0);
+            return true;
+        }
+
+        claimDaily(player);
+        return true;
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInteract(PlayerInteractEvent event) {
+        ItemStack stack = event.getItem();
+        if (!isDailyCrate(stack)) return;
+
+        Action action = event.getAction();
+        if (action == Action.RIGHT_CLICK_AIR || action == Action.RIGHT_CLICK_BLOCK) {
+            event.setCancelled(true);
+            openRewardPreview(event.getPlayer(), 0);
+            play(event.getPlayer(), "block.chest.open", 0.75f, 1.15f);
+            return;
+        }
+        if (action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK) {
+            event.setCancelled(true);
+            startRoll(event.getPlayer(), stack, event.getHand());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInventoryClick(InventoryClickEvent event) {
+        if (!(event.getWhoClicked() instanceof Player player)) return;
+        Inventory top = event.getView().getTopInventory();
+        if (!(top.getHolder() instanceof DailyGui holder)) return;
+        event.setCancelled(true);
+
+        int raw = event.getRawSlot();
+        if (raw < 0 || raw >= top.getSize()) return;
+        play(player, "ui.button.click", 0.45f, 1.25f);
+
+        switch (holder.type) {
+            case MAIN -> handleMainConfigClick(player, raw, event.isRightClick());
+            case REWARDS -> handleRewardsClick(player, holder.page, raw);
+            case REWARD_EDIT -> handleRewardEditClick(player, holder.rewardIndex, raw, event.isRightClick());
+            case PREVIEW -> handlePreviewClick(player, holder.page, raw);
+            case ROLL -> { }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInventoryDrag(InventoryDragEvent event) {
+        if (event.getView().getTopInventory().getHolder() instanceof DailyGui) {
+            event.setCancelled(true);
+        }
+    }
+
+    private void claimDaily(Player player) {
+        long now = System.currentTimeMillis();
+        long cooldown = Math.max(1, settings.cooldownHours) * HOUR;
+        long last = claims.getOrDefault(player.getUniqueId(), 0L);
+        long remaining = last + cooldown - now;
+        if (remaining > 0) {
+            player.sendMessage(PREFIX + "§eYour next Daily Crate is available in §6" + formatDuration(remaining) + "§e.");
+            play(player, "block.note_block.bass", 0.7f, 0.75f);
+            return;
+        }
+        claims.put(player.getUniqueId(), now);
+        saveClaims();
+        giveItem(player, createCrate());
+        player.sendMessage(PREFIX + "§aYou claimed your §6§lDaily Crate§a! §7Left-click it to open or right-click to view rewards.");
+        play(player, "entity.player.levelup", 0.9f, 1.15f);
+    }
+
+    private void startRoll(Player player, ItemStack crateStack, EquipmentSlot handSlot) {
+        if (rolling.containsKey(player.getUniqueId())) {
+            player.sendMessage(PREFIX + "§cYou already have a Daily Crate opening.");
+            return;
+        }
+        if (rewards.isEmpty()) {
+            player.sendMessage(PREFIX + "§cThis Daily Crate has no rewards configured yet.");
+            return;
+        }
+
+        consumeOneCrate(player, crateStack, handSlot);
+        Reward winner = chooseReward();
+        Inventory inv = Bukkit.createInventory(new DailyGui(GuiType.ROLL, 0, -1), 27, GUI_ROLL);
+        decorateRoll(inv);
+        player.openInventory(inv);
+
+        RollSession session = new RollSession(player, inv, winner);
+        rolling.put(player.getUniqueId(), session);
+        session.task = getServer().getScheduler().runTaskTimer(this, () -> tickRoll(session), 0L, 2L);
+    }
+
+    private void tickRoll(RollSession session) {
+        if (session.awarded) return;
+        Player player = session.player;
+        if (player == null || !player.isOnline()) {
+            finishRoll(session, true);
+            return;
+        }
+
+        session.step++;
+        for (int slot = 10; slot <= 16; slot++) {
+            Reward r = rewards.get(ThreadLocalRandom.current().nextInt(rewards.size()));
+            ItemStack icon = r.item.clone();
+            icon.setAmount(Math.max(1, Math.min(icon.getAmount(), icon.getMaxStackSize())));
+            session.inventory.setItem(slot, icon);
+        }
+
+        if (session.step >= 25) {
+            session.inventory.setItem(13, session.reward.item.clone());
+            play(player, "block.note_block.pling", 0.85f, 1.75f);
+            finishRoll(session, false);
+            return;
+        }
+
+        float pitch = Math.min(1.8f, 0.7f + session.step * 0.045f);
+        play(player, "block.note_block.hat", 0.4f, pitch);
+    }
+
+    private void finishRoll(RollSession session, boolean offline) {
+        if (session.awarded) return;
+        session.awarded = true;
+        try { if (session.task != null) session.task.cancel(); } catch (Throwable ignored) { }
+        rolling.remove(session.player.getUniqueId());
+
+        if (offline) {
+            award(session.player, session.reward, true);
+            return;
+        }
+
+        getServer().getScheduler().runTaskLater(this, () -> {
+            award(session.player, session.reward, false);
+            if (session.player.isOnline()) session.player.closeInventory();
+        }, 12L);
+    }
+
+    private void award(Player player, Reward reward, boolean quiet) {
+        if (player == null || reward == null) return;
+        giveItem(player, reward.item.clone());
+        if (!quiet && player.isOnline()) {
+            String itemName = itemDisplayName(reward.item, reward.rarity);
+            player.sendMessage(PREFIX + "§aYou won §fx" + reward.item.getAmount() + " " + itemName + "§a! §7(" + reward.rarity.color + reward.rarity.display + "§7)");
+            player.sendTitle(reward.rarity.color + "§l" + reward.rarity.display, "§fx" + reward.item.getAmount() + " " + itemName, 5, 45, 10);
+            play(player, reward.rarity == Rarity.EPIC ? "ui.toast.challenge_complete" : "entity.player.levelup", 1.0f, reward.rarity == Rarity.EPIC ? 1.0f : 1.25f);
+            spawnRewardParticles(player, reward.rarity);
+        }
+
+        if (settings.epicBroadcast && reward.rarity == Rarity.EPIC) {
+            String name = broadcastItemName(reward.item);
+            Bukkit.broadcastMessage("§6" + player.getName() + " just got x" + reward.item.getAmount() + " " + name + "§6 from Daily Crate!");
+        }
+    }
+
+    private void spawnRewardParticles(Player player, Rarity rarity) {
+        try {
+            Location loc = player.getLocation().clone().add(0, 1.0, 0);
+            World world = player.getWorld();
+            world.spawnParticle(Particle.FIREWORK, loc, rarity == Rarity.EPIC ? 90 : 55, 0.65, 0.9, 0.65, 0.14);
+            world.spawnParticle(Particle.HAPPY_VILLAGER, loc, rarity == Rarity.EPIC ? 45 : 20, 0.7, 0.8, 0.7, 0.08);
+        } catch (Throwable t) {
+            getLogger().log(Level.FINE, "Particle effect failed", t);
+        }
+    }
+
+    private Reward chooseReward() {
+        double total = totalWeight();
+        if (total <= 0) return rewards.get(ThreadLocalRandom.current().nextInt(rewards.size()));
+        double roll = ThreadLocalRandom.current().nextDouble(total);
+        for (Reward r : rewards) {
+            roll -= Math.max(0.0001, r.weight);
+            if (roll <= 0) return r;
+        }
+        return rewards.get(rewards.size() - 1);
+    }
+
+    private double totalWeight() {
+        double total = 0;
+        for (Reward r : rewards) total += Math.max(0.0001, r.weight);
+        return total;
+    }
+
+    private void openMainConfig(Player player) {
+        Inventory inv = Bukkit.createInventory(new DailyGui(GuiType.MAIN, 0, -1), 27, GUI_MAIN);
+        fill(inv);
+
+        ItemStack crate = createCrate();
+        inv.setItem(4, withGuiLore(crate, List.of(
+                "§8Crate Appearance",
+                "",
+                "§7Hold an item and click this",
+                "§7to use its material/name/lore",
+                "§7as the Daily Crate appearance.",
+                "",
+                "§eClick to set from held item"
+        )));
+
+        inv.setItem(10, button("CHEST", "§6§lRewards", List.of(
+                "§7Configured rewards: §f" + rewards.size(),
+                "§7Manage items, rarity and chance.",
+                "",
+                "§eClick to open reward editor"
+        )));
+        inv.setItem(12, button("CLOCK", "§e§lClaim Cooldown", List.of(
+                "§7Current: §f" + settings.cooldownHours + " hours",
+                "",
+                "§7Cycles common cooldown presets.",
+                "§eLeft-click: next",
+                "§eRight-click: previous"
+        )));
+        inv.setItem(14, button(settings.epicBroadcast ? "LIME_DYE" : "GRAY_DYE", "§d§lEpic Broadcast", List.of(
+                "§7Status: " + (settings.epicBroadcast ? "§aENABLED" : "§cDISABLED"),
+                "§7When an EPIC reward is won,",
+                "§7announce it to the whole server.",
+                "",
+                "§eClick to toggle"
+        )));
+        inv.setItem(16, button("TRIPWIRE_HOOK", "§a§lGive Test Crate", List.of(
+                "§7Gives you a crate immediately.",
+                "§7Does not affect your daily cooldown.",
+                "",
+                "§eClick for a test crate"
+        )));
+        inv.setItem(22, button("BARRIER", "§cClose", List.of("§7Close configuration.")));
+        player.openInventory(inv);
+    }
+
+    private void handleMainConfigClick(Player player, int slot, boolean rightClick) {
+        if (!player.isOp()) { player.closeInventory(); return; }
+        if (slot == 4) {
+            ItemStack hand = player.getInventory().getItemInMainHand();
+            if (hand == null || hand.getType() == Material.AIR || isDailyCrate(hand)) {
+                player.sendMessage(PREFIX + "§cHold the item you want to use as the crate appearance first.");
+                play(player, "entity.villager.no", 0.8f, 0.8f);
+                return;
+            }
+            settings.crateBase = hand.clone();
+            settings.crateBase.setAmount(1);
+            stripCrateMarker(settings.crateBase);
+            saveSettings();
+            player.sendMessage(PREFIX + "§aDaily Crate appearance updated.");
+            openMainConfig(player);
+        } else if (slot == 10) {
+            openRewardsConfig(player, 0);
+        } else if (slot == 12) {
+            long[] presets = {12, 24, 48, 72, 168};
+            int idx = 0;
+            for (int i = 0; i < presets.length; i++) if (presets[i] == settings.cooldownHours) idx = i;
+            settings.cooldownHours = presets[rightClick ? (idx - 1 + presets.length) % presets.length : (idx + 1) % presets.length];
+            saveSettings();
+            openMainConfig(player);
+        } else if (slot == 14) {
+            settings.epicBroadcast = !settings.epicBroadcast;
+            saveSettings();
+            openMainConfig(player);
+        } else if (slot == 16) {
+            giveItem(player, createCrate());
+            player.sendMessage(PREFIX + "§aTest Daily Crate added to your inventory.");
+            play(player, "entity.item.pickup", 0.8f, 1.3f);
+        } else if (slot == 22) {
+            player.closeInventory();
+        }
+    }
+
+    private void openRewardsConfig(Player player, int page) {
+        int pages = Math.max(1, (int) Math.ceil(rewards.size() / 45.0));
+        page = Math.max(0, Math.min(page, pages - 1));
+        Inventory inv = Bukkit.createInventory(new DailyGui(GuiType.REWARDS, page, -1), 54, GUI_REWARDS + " §8(" + (page + 1) + "/" + pages + ")");
+        fillBottom(inv);
+        int start = page * 45;
+        for (int slot = 0; slot < 45; slot++) {
+            int index = start + slot;
+            if (index >= rewards.size()) break;
+            inv.setItem(slot, rewardPreview(rewards.get(index), index, true));
+        }
+        if (page > 0) inv.setItem(45, button("ARROW", "§ePrevious Page", List.of("§7Page " + page + " of " + pages)));
+        inv.setItem(48, button("EMERALD", "§a§lAdd Held Item", List.of(
+                "§7Adds an exact copy of the item",
+                "§7currently in your main hand.",
+                "",
+                "§7Default rarity: §7COMMON",
+                "§7Default weight: §f50",
+                "§eClick to add"
+        )));
+        inv.setItem(49, button("BOOK", "§f§lHow Rewards Work", List.of(
+                "§7Click a reward to edit it.",
+                "§7Its normal name, lore and enchantments",
+                "§7are preserved in previews and winnings.",
+                "",
+                "§7Chance is calculated from each reward's",
+                "§7weight relative to all reward weights."
+        )));
+        inv.setItem(50, button("BARRIER", "§cBack", List.of("§7Return to Daily Crate config.")));
+        if (page + 1 < pages) inv.setItem(53, button("ARROW", "§eNext Page", List.of("§7Page " + (page + 2) + " of " + pages)));
+        player.openInventory(inv);
+    }
+
+    private void handleRewardsClick(Player player, int page, int slot) {
+        if (!player.isOp()) { player.closeInventory(); return; }
+        if (slot >= 0 && slot < 45) {
+            int index = page * 45 + slot;
+            if (index < rewards.size()) openRewardEditor(player, index);
+            return;
+        }
+        if (slot == 45 && page > 0) openRewardsConfig(player, page - 1);
+        else if (slot == 48) {
+            ItemStack hand = player.getInventory().getItemInMainHand();
+            if (hand == null || hand.getType() == Material.AIR) {
+                player.sendMessage(PREFIX + "§cHold the reward item in your main hand first.");
+                return;
+            }
+            rewards.add(new Reward(hand.clone(), Rarity.COMMON, 50));
+            saveRewards();
+            player.sendMessage(PREFIX + "§aReward added. Click it to edit rarity and chance.");
+            openRewardsConfig(player, Math.max(0, (rewards.size() - 1) / 45));
+        } else if (slot == 50) openMainConfig(player);
+        else if (slot == 53 && (page + 1) * 45 < rewards.size()) openRewardsConfig(player, page + 1);
+    }
+
+    private void openRewardEditor(Player player, int index) {
+        if (index < 0 || index >= rewards.size()) { openRewardsConfig(player, 0); return; }
+        Reward reward = rewards.get(index);
+        Inventory inv = Bukkit.createInventory(new DailyGui(GuiType.REWARD_EDIT, 0, index), 27, GUI_REWARD_EDIT);
+        fill(inv);
+        inv.setItem(4, rewardPreview(reward, index, false));
+        inv.setItem(10, button("AMETHYST_SHARD", "§f§lRarity: " + reward.rarity.color + reward.rarity.display, List.of(
+                "§7Rarity controls the reward's",
+                "§7label/color in the crate UI.",
+                "",
+                "§eLeft-click: next rarity",
+                "§eRight-click: previous rarity"
+        )));
+        inv.setItem(13, button("GOLD_NUGGET", "§f§lChance Weight: " + reward.rarity.color + trimWeight(reward.weight), List.of(
