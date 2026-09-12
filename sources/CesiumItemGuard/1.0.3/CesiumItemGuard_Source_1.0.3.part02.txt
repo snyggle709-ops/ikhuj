@@ -1,0 +1,230 @@
+            notifyController("§c[ItemGuard] §7Sanitized a dangerous container item opened by §f" + opener + "§7: §c" + result.itemType);
+        }
+    }
+
+    private void enforce(Player player, Inspection inspection, String source) {
+        if (player == null) return;
+        UUID uuid = player.getUniqueId();
+        if (!enforcementInProgress.add(uuid)) return;
+        detections.incrementAndGet();
+
+        String name = player.getName();
+        appendLog("ENFORCE player=" + name + " uuid=" + uuid + " source=" + source + " item=" + inspection.itemType + " bytes=" + inspection.serializedBytes + " reasons=" + String.join("|", inspection.reasons));
+        getLogger().severe("Item exploit detected from " + name + " (" + uuid + ") via " + source + ". Removed item and handing permanent blacklist to WorldsGreatestModeration. Reasons: " + String.join("; ", inspection.reasons));
+        notifyController("§4§l[ItemGuard] §c" + name + " §7triggered exploit-item detection. §fWGM §7is applying a permanent §c" + BLACKLIST_REASON + " §7blacklist. §8(" + inspection.itemType + ": " + shortReasons(inspection.reasons) + ")");
+
+        boolean dispatched = dispatchWgmBlacklist(name);
+        if (!dispatched) {
+            getLogger().severe("Could not dispatch the WGM blacklist for " + name + ". The exploit item was removed, but ItemGuard does not maintain its own blacklist.");
+            notifyController("§4§l[ItemGuard] §cWARNING: WGM blacklist dispatch failed for §f" + name + "§c. ItemGuard has no fallback blacklist by design.");
+        }
+
+        getServer().getScheduler().runTask(this, () -> enforcementInProgress.remove(uuid));
+    }
+
+    private boolean dispatchWgmBlacklist(String username) {
+        if (!hasWgm()) return false;
+        try {
+            String args = username + " forever " + BLACKLIST_REASON;
+            if (Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "worldsgreatestmoderation:blacklist " + args)) return true;
+            return Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "blacklist " + args);
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "WGM blacklist dispatch failed for " + username, t);
+            return false;
+        }
+    }
+
+    private boolean hasWgm() {
+        try { return getServer().getPluginManager().getPlugin("WorldsGreatestModeration") != null; }
+        catch (Throwable ignored) { return false; }
+    }
+
+    private void notifyController(String message) {
+        Player controller = Bukkit.getPlayerExact(OWNER_NAME);
+        if (controller != null) controller.sendMessage(message);
+    }
+
+    private void logDetection(Player player, Inspection inspection, String source) {
+        appendLog("DETECT player=" + safeName(player) + " uuid=" + player.getUniqueId() + " source=" + source + " item=" + inspection.itemType + " bytes=" + inspection.serializedBytes + " reasons=" + String.join("|", inspection.reasons));
+    }
+
+    /* ----------------------------- item inspection ----------------------------- */
+
+    private Inspection inspect(ItemStack stack) {
+        itemsInspected.incrementAndGet();
+        return inspect(stack, 0, new IdentityHashMap<>());
+    }
+
+    private Inspection inspect(ItemStack stack, int itemDepth, IdentityHashMap<Object, Boolean> seen) {
+        Inspection out = new Inspection(stack == null ? "null" : safeType(stack));
+        if (stack == null || stack.getType() == Material.AIR) return out;
+        if (itemDepth > cfg.maxItemRecursionDepth) {
+            out.add("item recursion depth > " + cfg.maxItemRecursionDepth);
+            return out;
+        }
+        if (seen.put(stack, Boolean.TRUE) != null) {
+            out.add("cyclic nested item graph");
+            return out;
+        }
+
+        String type = safeType(stack);
+        int amount = stack.getAmount();
+        int vanillaMax = stack.getType().getMaxStackSize();
+        int effectiveMax = stack.getMaxStackSize();
+        if (amount <= 0) out.add("invalid stack amount " + amount);
+        // Do not treat a raw amount above the vanilla/effective stack limit as a blacklist-worthy exploit by itself.
+        // Server-side command plugins (notably Essentials-style /give behavior) can legitimately construct these stacks.
+        // Malicious custom max-stack-size components are still detected below by inspectGenericMeta().
+        // Other illegal metadata/components still trigger normal ItemGuard enforcement.
+
+        boolean suspiciousType = isHighRiskType(type);
+        boolean hasMeta = stack.hasItemMeta();
+
+        // Raw NBT/component size is a critical catch-all. Paper exposes serializeAsBytes().
+        if (hasMeta || suspiciousType) {
+            CallResult bytesCall = callResult(stack, "serializeAsBytes");
+            if (bytesCall.exists && !bytesCall.ok) {
+                out.add("raw item serialization failed");
+            } else if (bytesCall.value instanceof byte[]) {
+                out.serializedBytes = ((byte[]) bytesCall.value).length;
+                if (out.serializedBytes > cfg.maxSerializedBytes) out.add("oversized serialized item " + out.serializedBytes + " bytes");
+            }
+            CallResult typesCall = callResult(stack, "getDataTypes");
+            if (typesCall.exists && !typesCall.ok) {
+                out.add("data-component inspection failed");
+            } else if (typesCall.value instanceof Collection<?> && ((Collection<?>) typesCall.value).size() > cfg.maxDataComponents) {
+                out.add("abnormal data-component count " + ((Collection<?>) typesCall.value).size());
+            }
+        }
+
+        ItemMeta meta;
+        try {
+            meta = stack.getItemMeta();
+        } catch (Throwable t) {
+            out.add("item metadata could not be safely read: " + t.getClass().getSimpleName());
+            seen.remove(stack);
+            return out;
+        }
+        if (meta == null) {
+            seen.remove(stack);
+            return out;
+        }
+
+        inspectGenericMeta(stack, meta, out);
+        inspectEnchantments(meta, out);
+        inspectAttributes(meta, out);
+        inspectPotion(meta, out);
+        inspectFirework(meta, out);
+        inspectBook(meta, out);
+        inspectBanner(meta, out);
+        inspectSpawnEgg(type, meta, out);
+        inspectNestedItems(type, meta, out, itemDepth, seen);
+
+        // Generic serialized structure catches malformed/abusive metadata not covered by a
+        // dedicated Bukkit meta interface. We intentionally only inspect simple containers.
+        CallResult serializedCall = callResult(stack, "serialize");
+        if (serializedCall.exists && !serializedCall.ok) {
+            out.add("Bukkit item serialization failed");
+        } else if (serializedCall.value instanceof Map<?, ?>) {
+            inspectObjectGraph(serializedCall.value, "item", 0, itemDepth, out, seen);
+        }
+
+        seen.remove(stack);
+        return out;
+    }
+
+    private void inspectGenericMeta(ItemStack stack, ItemMeta meta, Inspection out) {
+        String display = meta.hasDisplayName() ? meta.getDisplayName() : null;
+        if (display != null && display.length() > cfg.maxDisplayNameChars) {
+            out.add("display name too long (" + display.length() + ")");
+        }
+        List<String> lore = meta.hasLore() ? meta.getLore() : null;
+        if (lore != null) {
+            if (lore.size() > cfg.maxLoreLines) out.add("too many lore lines (" + lore.size() + ")");
+            for (String line : lore) {
+                if (line != null && line.length() > cfg.maxLoreLineChars) {
+                    out.add("lore line too long (" + line.length() + ")");
+                    break;
+                }
+            }
+        }
+        if (cfg.blockUnbreakable && meta.isUnbreakable()) {
+            out.add("unobtainable unbreakable item");
+        }
+        if (cfg.blockCustomMaxStack && meta.hasMaxStackSize()) {
+            int custom = meta.getMaxStackSize();
+            int vanilla = stack.getType().getMaxStackSize();
+            if (custom <= 0 || custom != vanilla) out.add("custom max-stack-size " + custom + " (vanilla " + vanilla + ")");
+        }
+    }
+
+    private void inspectEnchantments(ItemMeta meta, Inspection out) {
+        if (!cfg.checkEnchantmentLevels && !cfg.checkEnchantmentConflicts) return;
+        Map<Enchantment, Integer> enchants = meta.getEnchants();
+        if (enchants.isEmpty()) return;
+        if (enchants.size() > cfg.maxEnchantments) out.add("too many enchantments (" + enchants.size() + ")");
+        List<Enchantment> keys = new ArrayList<>(enchants.size());
+        for (Map.Entry<Enchantment, Integer> e : enchants.entrySet()) {
+            Enchantment enchant = e.getKey();
+            int level = e.getValue() == null ? 0 : e.getValue();
+            keys.add(enchant);
+            if (cfg.checkEnchantmentLevels) {
+                int min = enchant.getStartLevel();
+                int max = enchant.getMaxLevel();
+                if (level < min || level > max) out.add("illegal enchantment level " + safeKey(enchant) + "=" + level + " (allowed " + min + "-" + max + ")");
+            }
+        }
+        if (cfg.checkEnchantmentConflicts && keys.size() <= 32) {
+            outer:
+            for (int i = 0; i < keys.size(); i++) {
+                for (int j = i + 1; j < keys.size(); j++) {
+                    if (keys.get(i).conflictsWith(keys.get(j))) {
+                        out.add("mutually exclusive enchantments " + safeKey(keys.get(i)) + "+" + safeKey(keys.get(j)));
+                        break outer;
+                    }
+                }
+            }
+        }
+    }
+
+    private void inspectAttributes(ItemMeta meta, Inspection out) {
+        Object multi = callQuiet(meta, "getAttributeModifiers");
+        if (multi == null) return;
+        Object entriesObj = callQuiet(multi, "entries");
+        if (!(entriesObj instanceof Collection<?>)) return;
+        Collection<?> entries = (Collection<?>) entriesObj;
+        if (entries.size() > cfg.maxAttributeModifiers) out.add("too many attribute modifiers (" + entries.size() + ")");
+        for (Object entryObj : entries) {
+            Object modifier = entryObj instanceof Map.Entry<?, ?> ? ((Map.Entry<?, ?>) entryObj).getValue() : null;
+            if (modifier == null) continue;
+            double amount = doubleValue(callQuiet(modifier, "getAmount"), 0D);
+            if (!Double.isFinite(amount)) {
+                out.add("non-finite attribute modifier");
+                break;
+            }
+            if (Math.abs(amount) > cfg.maxAttributeAbsoluteAmount) {
+                out.add("extreme attribute modifier " + amount);
+                break;
+            }
+        }
+    }
+
+    private void inspectPotion(ItemMeta meta, Inspection out) {
+        Method customEffectsMethod = findMethod(meta.getClass(), "getCustomEffects", 0);
+        if (customEffectsMethod == null) return;
+        Object effectsObj = invokeMethodQuiet(meta, customEffectsMethod);
+        if (!(effectsObj instanceof List<?>)) return;
+        List<?> effects = (List<?>) effectsObj;
+        if (effects.size() > cfg.maxCustomPotionEffects) out.add("too many custom potion effects (" + effects.size() + ")");
+        for (Object effect : effects) {
+            int amp = intValue(callQuiet(effect, "getAmplifier"), 0);
+            int duration = intValue(callQuiet(effect, "getDuration"), 0);
+            String effectName = safeKey(callQuiet(effect, "getType")).toUpperCase(Locale.ROOT);
+            if (amp < 0 || amp > cfg.maxCustomPotionAmplifier) {
+                out.add("illegal potion amplifier " + effectName + "=" + amp);
+                continue;
+            }
+            if ((effectName.contains("HARM") || effectName.contains("INSTANT_DAMAGE")) && amp > 1) {
+                out.add("instant-damage potion above vanilla strength (amplifier " + amp + ")");
+            }
+            if (duration > cfg.maxCustomPotionDurationTicks) {
