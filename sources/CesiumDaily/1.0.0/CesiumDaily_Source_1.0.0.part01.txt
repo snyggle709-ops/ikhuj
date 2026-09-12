@@ -1,0 +1,460 @@
+                "§7Current real chance: " + reward.rarity.color + chanceFormat.format(chancePercent(reward)) + "%",
+                "§7Weight is compared with all rewards.",
+                "",
+                "§eLeft-click: next weight",
+                "§eRight-click: previous weight"
+        )));
+        inv.setItem(16, button("LAVA_BUCKET", "§c§lDelete Reward", List.of(
+                "§7Permanently removes this reward",
+                "§7from the Daily Crate pool.",
+                "",
+                "§cClick to delete"
+        )));
+        inv.setItem(22, button("ARROW", "§eBack to Rewards", List.of("§7Changes save immediately.")));
+        player.openInventory(inv);
+    }
+
+    private void handleRewardEditClick(Player player, int index, int slot, boolean rightClick) {
+        if (!player.isOp()) { player.closeInventory(); return; }
+        if (index < 0 || index >= rewards.size()) { openRewardsConfig(player, 0); return; }
+        Reward reward = rewards.get(index);
+        if (slot == 10) {
+            reward.rarity = rightClick ? reward.rarity.previous() : reward.rarity.next();
+            saveRewards();
+            openRewardEditor(player, index);
+        } else if (slot == 13) {
+            int current = nearestWeightIndex(reward.weight);
+            current = rightClick ? (current - 1 + WEIGHTS.length) % WEIGHTS.length : (current + 1) % WEIGHTS.length;
+            reward.weight = WEIGHTS[current];
+            saveRewards();
+            openRewardEditor(player, index);
+        } else if (slot == 16) {
+            rewards.remove(index);
+            saveRewards();
+            player.sendMessage(PREFIX + "§cReward removed.");
+            openRewardsConfig(player, Math.max(0, index / 45));
+        } else if (slot == 22) {
+            openRewardsConfig(player, Math.max(0, index / 45));
+        }
+    }
+
+    private void openRewardPreview(Player player, int page) {
+        int pages = Math.max(1, (int) Math.ceil(rewards.size() / 45.0));
+        page = Math.max(0, Math.min(page, pages - 1));
+        Inventory inv = Bukkit.createInventory(new DailyGui(GuiType.PREVIEW, page, -1), 54, GUI_PREVIEW + " §8(" + (page + 1) + "/" + pages + ")");
+        fillBottom(inv);
+        int start = page * 45;
+        for (int slot = 0; slot < 45; slot++) {
+            int index = start + slot;
+            if (index >= rewards.size()) break;
+            inv.setItem(slot, rewardPreview(rewards.get(index), index, false));
+        }
+        if (rewards.isEmpty()) inv.setItem(22, button("BARRIER", "§cNo Rewards Configured", List.of("§7Ask an operator to configure the crate.")));
+        if (page > 0) inv.setItem(45, button("ARROW", "§ePrevious Page", List.of("§7Page " + page + " of " + pages)));
+        inv.setItem(49, button("CHEST", "§6§lDaily Crate Rewards", List.of(
+                "§7Hover over any reward to see",
+                "§7its normal item information,",
+                "§7chance and rarity.",
+                "",
+                "§7Left-click a Daily Crate to roll."
+        )));
+        inv.setItem(50, button("BARRIER", "§cClose", List.of("§7Close reward preview.")));
+        if (page + 1 < pages) inv.setItem(53, button("ARROW", "§eNext Page", List.of("§7Page " + (page + 2) + " of " + pages)));
+        player.openInventory(inv);
+    }
+
+    private void handlePreviewClick(Player player, int page, int slot) {
+        int pages = Math.max(1, (int) Math.ceil(rewards.size() / 45.0));
+        if (slot == 45 && page > 0) openRewardPreview(player, page - 1);
+        else if (slot == 50) player.closeInventory();
+        else if (slot == 53 && page + 1 < pages) openRewardPreview(player, page + 1);
+    }
+
+    private ItemStack rewardPreview(Reward reward, int index, boolean admin) {
+        ItemStack copy = reward.item.clone();
+        ItemMeta meta = copy.getItemMeta();
+        if (meta == null) return copy;
+        List<String> lore = meta.hasLore() && meta.getLore() != null ? new ArrayList<>(meta.getLore()) : new ArrayList<>();
+        if (!lore.isEmpty()) lore.add("");
+        lore.add("§8━━━━━━━━━━━━━━━━━━━━");
+        lore.add("§7Chance: " + reward.rarity.color + chanceFormat.format(chancePercent(reward)) + "%");
+        lore.add("§7Rarity: " + reward.rarity.color + "§l" + reward.rarity.display);
+        if (admin) {
+            lore.add("§7Weight: §f" + trimWeight(reward.weight));
+            lore.add("");
+            lore.add("§eClick to edit this reward");
+            lore.add("§8Reward #" + (index + 1));
+        }
+        meta.setLore(lore);
+        copy.setItemMeta(meta);
+        return copy;
+    }
+
+    private double chancePercent(Reward reward) {
+        double total = totalWeight();
+        if (total <= 0) return 0;
+        return (Math.max(0.0001, reward.weight) / total) * 100.0;
+    }
+
+    private void decorateRoll(Inventory inv) {
+        ItemStack border = button("BLACK_STAINED_GLASS_PANE", "§r", List.of());
+        for (int i = 0; i < inv.getSize(); i++) inv.setItem(i, border);
+        for (int i = 10; i <= 16; i++) inv.setItem(i, null);
+        inv.setItem(4, button("ARROW", "§6§l▼ WINNER ▼", List.of("§7The reel will stop on the center slot.")));
+        inv.setItem(22, button("ARROW", "§6§l▲ WINNER ▲", List.of("§7Good luck!")));
+        inv.setItem(13, button("CHEST", "§eRolling...", List.of("§7Your reward is being selected.")));
+    }
+
+    private void fill(Inventory inv) {
+        ItemStack filler = button("GRAY_STAINED_GLASS_PANE", "§r", List.of());
+        for (int i = 0; i < inv.getSize(); i++) inv.setItem(i, filler);
+    }
+
+    private void fillBottom(Inventory inv) {
+        ItemStack filler = button("GRAY_STAINED_GLASS_PANE", "§r", List.of());
+        for (int i = 45; i < 54; i++) inv.setItem(i, filler);
+    }
+
+    private ItemStack button(String materialName, String name, List<String> lore) {
+        Material material = Material.matchMaterial(materialName);
+        if (material == null) material = Material.PAPER;
+        ItemStack item = new ItemStack(material, 1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName(name);
+            meta.setLore(new ArrayList<>(lore));
+            item.setItemMeta(meta);
+        }
+        return item;
+    }
+
+    private ItemStack withGuiLore(ItemStack base, List<String> extra) {
+        ItemStack copy = base.clone();
+        ItemMeta meta = copy.getItemMeta();
+        if (meta == null) return copy;
+        List<String> lore = meta.hasLore() && meta.getLore() != null ? new ArrayList<>(meta.getLore()) : new ArrayList<>();
+        lore.removeIf(line -> line != null && line.contains("Left-click to open") || line != null && line.contains("Right-click to view rewards"));
+        if (!lore.isEmpty()) lore.add("");
+        lore.addAll(extra);
+        meta.setLore(lore);
+        copy.setItemMeta(meta);
+        return copy;
+    }
+
+    private ItemStack createCrate() {
+        ItemStack item = settings.crateBase == null ? defaultCrateBase() : settings.crateBase.clone();
+        item.setAmount(1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            if (!meta.hasDisplayName()) meta.setDisplayName("§6§lDaily Crate");
+            List<String> lore = meta.hasLore() && meta.getLore() != null ? new ArrayList<>(meta.getLore()) : new ArrayList<>();
+            removeInstructionLore(lore);
+            if (!lore.isEmpty()) lore.add("");
+            lore.add("§eLeft-click §7to open");
+            lore.add("§eRight-click §7to view rewards");
+            lore.add("§8A CesiumMC Daily Crate");
+            meta.setLore(lore);
+            PersistentDataContainer pdc = meta.getPersistentDataContainer();
+            pdc.set(crateKey, PersistentDataType.STRING, "1");
+            item.setItemMeta(meta);
+        }
+        return item;
+    }
+
+    private ItemStack defaultCrateBase() {
+        Material m = Material.matchMaterial("ENDER_CHEST");
+        if (m == null) m = Material.CHEST;
+        ItemStack item = new ItemStack(m, 1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName("§6§lDaily Crate");
+            meta.setLore(new ArrayList<>());
+            item.setItemMeta(meta);
+        }
+        return item;
+    }
+
+    private boolean isDailyCrate(ItemStack item) {
+        if (item == null || item.getType() == Material.AIR) return false;
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) return false;
+        try { return meta.getPersistentDataContainer().has(crateKey, PersistentDataType.STRING); }
+        catch (Throwable ignored) { return false; }
+    }
+
+    private void stripCrateMarker(ItemStack item) {
+        if (item == null) return;
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) return;
+        try { meta.getPersistentDataContainer().remove(crateKey); } catch (Throwable ignored) { }
+        List<String> lore = meta.hasLore() && meta.getLore() != null ? new ArrayList<>(meta.getLore()) : new ArrayList<>();
+        removeInstructionLore(lore);
+        meta.setLore(lore);
+        item.setItemMeta(meta);
+    }
+
+    private void removeInstructionLore(List<String> lore) {
+        lore.removeIf(line -> line != null && (
+                line.contains("Left-click") && line.contains("open") ||
+                line.contains("Right-click") && line.contains("view rewards") ||
+                line.contains("A CesiumMC Daily Crate")
+        ));
+        while (!lore.isEmpty() && lore.get(lore.size() - 1).isEmpty()) lore.remove(lore.size() - 1);
+    }
+
+    private void consumeOneCrate(Player player, ItemStack clicked, EquipmentSlot handSlot) {
+        PlayerInventory inv = player.getInventory();
+        boolean offHand = handSlot == EquipmentSlot.OFF_HAND;
+        ItemStack hand = offHand ? inv.getItemInOffHand() : inv.getItemInMainHand();
+        if (hand != null && isDailyCrate(hand)) {
+            if (hand.getAmount() <= 1) {
+                if (offHand) inv.setItemInOffHand(new ItemStack(Material.AIR, 1));
+                else inv.setItemInMainHand(new ItemStack(Material.AIR, 1));
+            } else {
+                hand.setAmount(hand.getAmount() - 1);
+            }
+            return;
+        }
+        if (clicked != null) {
+            if (clicked.getAmount() > 1) clicked.setAmount(clicked.getAmount() - 1);
+            else clicked.setAmount(0);
+        }
+    }
+
+    private void giveItem(Player player, ItemStack item) {
+        Map<Integer, ItemStack> leftovers = player.getInventory().addItem(item);
+        if (!leftovers.isEmpty()) {
+            for (ItemStack left : leftovers.values()) player.getWorld().dropItemNaturally(player.getLocation(), left);
+            player.sendMessage(PREFIX + "§eYour inventory was full, so the reward was dropped at your feet.");
+        }
+    }
+
+    private String itemDisplayName(ItemStack item, Rarity rarity) {
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null && meta.hasDisplayName()) {
+            String name = meta.getDisplayName();
+            return hasColor(name) ? name : rarity.color + stripColors(name);
+        }
+        return rarity.color + prettyMaterial(item.getType().name());
+    }
+
+    private String broadcastItemName(ItemStack item) {
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null && meta.hasDisplayName()) {
+            String name = meta.getDisplayName();
+            return hasColor(name) ? name : "§d" + stripColors(name);
+        }
+        return "§d" + prettyMaterial(item.getType().name());
+    }
+
+    private boolean hasColor(String s) {
+        if (s == null) return false;
+        for (int i = 0; i + 1 < s.length(); i++) {
+            if (s.charAt(i) == '§') {
+                char c = Character.toLowerCase(s.charAt(i + 1));
+                if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == 'x') return true;
+            }
+        }
+        return false;
+    }
+
+    private String stripColors(String s) {
+        if (s == null) return "Item";
+        return s.replaceAll("(?i)§[0-9A-FK-ORX]", "");
+    }
+
+    private String prettyMaterial(String raw) {
+        String[] parts = raw.toLowerCase(Locale.ROOT).split("_");
+        StringBuilder out = new StringBuilder();
+        for (String part : parts) {
+            if (part.isEmpty()) continue;
+            if (out.length() > 0) out.append(' ');
+            out.append(Character.toUpperCase(part.charAt(0))).append(part.substring(1));
+        }
+        return out.toString();
+    }
+
+    private int nearestWeightIndex(double weight) {
+        int best = 0;
+        double distance = Double.MAX_VALUE;
+        for (int i = 0; i < WEIGHTS.length; i++) {
+            double d = Math.abs(WEIGHTS[i] - weight);
+            if (d < distance) { distance = d; best = i; }
+        }
+        return best;
+    }
+
+    private String trimWeight(double weight) {
+        if (Math.rint(weight) == weight) return Long.toString((long) weight);
+        return chanceFormat.format(weight);
+    }
+
+    private String formatDuration(long millis) {
+        long seconds = Math.max(0, millis / 1000);
+        long days = seconds / 86400; seconds %= 86400;
+        long hours = seconds / 3600; seconds %= 3600;
+        long minutes = seconds / 60; seconds %= 60;
+        if (days > 0) return days + "d " + hours + "h";
+        if (hours > 0) return hours + "h " + minutes + "m";
+        if (minutes > 0) return minutes + "m " + seconds + "s";
+        return seconds + "s";
+    }
+
+    private void play(Player player, String sound, float volume, float pitch) {
+        try { player.playSound(player.getLocation(), sound, volume, pitch); } catch (Throwable ignored) { }
+    }
+
+    private void loadAll() {
+        settingsYaml = YamlConfiguration.loadConfiguration(settingsFile);
+        rewardsYaml = YamlConfiguration.loadConfiguration(rewardsFile);
+        claimsYaml = YamlConfiguration.loadConfiguration(claimsFile);
+
+        settings = new Settings();
+        settings.cooldownHours = settingsYaml.getLong("cooldown-hours", 24L);
+        settings.epicBroadcast = settingsYaml.getBoolean("epic-broadcast", true);
+        settings.crateBase = settingsYaml.getItemStack("crate-base");
+        if (settings.crateBase == null) settings.crateBase = defaultCrateBase();
+
+        rewards.clear();
+        ConfigurationSection section = rewardsYaml.getConfigurationSection("rewards");
+        if (section != null) {
+            List<String> keys = new ArrayList<>(section.getKeys(false));
+            keys.sort(Comparator.comparingInt(this::safeInt));
+            for (String key : keys) {
+                ItemStack item = rewardsYaml.getItemStack("rewards." + key + ".item");
+                if (item == null || item.getType() == Material.AIR) continue;
+                String rarityRaw = rewardsYaml.getString("rewards." + key + ".rarity", "COMMON");
+                double weight = rewardsYaml.getDouble("rewards." + key + ".weight", 50.0);
+                rewards.add(new Reward(item, Rarity.parse(rarityRaw), Math.max(0.0001, weight)));
+            }
+        }
+        if (rewards.isEmpty()) {
+            addDefaultRewards();
+            saveRewards();
+        }
+
+        claims.clear();
+        ConfigurationSection claimSection = claimsYaml.getConfigurationSection("claims");
+        if (claimSection != null) {
+            for (String key : claimSection.getKeys(false)) {
+                try { claims.put(UUID.fromString(key), claimsYaml.getLong("claims." + key, 0L)); }
+                catch (IllegalArgumentException ignored) { }
+            }
+        }
+        saveSettings();
+    }
+
+    private void addDefaultRewards() {
+        addDefault("IRON_INGOT", 16, Rarity.COMMON, 50);
+        addDefault("GOLD_INGOT", 10, Rarity.UNCOMMON, 30);
+        addDefault("EMERALD", 8, Rarity.RARE, 16);
+        addDefault("DIAMOND", 4, Rarity.RARE, 10);
+        addDefault("ENCHANTED_GOLDEN_APPLE", 1, Rarity.EPIC, 4);
+        addDefault("NETHERITE_INGOT", 1, Rarity.LEGENDARY, 1);
+    }
+
+    private void addDefault(String materialName, int amount, Rarity rarity, double weight) {
+        Material material = Material.matchMaterial(materialName);
+        if (material != null) rewards.add(new Reward(new ItemStack(material, amount), rarity, weight));
+    }
+
+    private int safeInt(String s) {
+        try { return Integer.parseInt(s); } catch (Throwable ignored) { return Integer.MAX_VALUE; }
+    }
+
+    private void saveSettings() {
+        if (settingsYaml == null || settings == null) return;
+        settingsYaml.set("cooldown-hours", settings.cooldownHours);
+        settingsYaml.set("epic-broadcast", settings.epicBroadcast);
+        settingsYaml.set("crate-base", settings.crateBase);
+        saveYaml(settingsYaml, settingsFile);
+    }
+
+    private void saveRewards() {
+        if (rewardsYaml == null) return;
+        rewardsYaml.set("rewards", null);
+        for (int i = 0; i < rewards.size(); i++) {
+            Reward reward = rewards.get(i);
+            String base = "rewards." + i;
+            rewardsYaml.set(base + ".item", reward.item);
+            rewardsYaml.set(base + ".rarity", reward.rarity.name());
+            rewardsYaml.set(base + ".weight", reward.weight);
+        }
+        saveYaml(rewardsYaml, rewardsFile);
+    }
+
+    private void saveClaims() {
+        if (claimsYaml == null) return;
+        claimsYaml.set("claims", null);
+        for (Map.Entry<UUID, Long> entry : claims.entrySet()) claimsYaml.set("claims." + entry.getKey(), entry.getValue());
+        saveYaml(claimsYaml, claimsFile);
+    }
+
+    private void saveYaml(YamlConfiguration yaml, File file) {
+        try { yaml.save(file); }
+        catch (IOException e) { getLogger().log(Level.SEVERE, "Could not save " + file.getName(), e); }
+    }
+
+    private static final class Settings {
+        long cooldownHours = 24;
+        boolean epicBroadcast = true;
+        ItemStack crateBase;
+    }
+
+    private static final class Reward {
+        final ItemStack item;
+        Rarity rarity;
+        double weight;
+        Reward(ItemStack item, Rarity rarity, double weight) {
+            this.item = item;
+            this.rarity = rarity;
+            this.weight = weight;
+        }
+    }
+
+    private enum Rarity {
+        COMMON("COMMON", "§7"),
+        UNCOMMON("UNCOMMON", "§a"),
+        RARE("RARE", "§b"),
+        EPIC("EPIC", "§d"),
+        LEGENDARY("LEGENDARY", "§6");
+
+        final String display;
+        final String color;
+        Rarity(String display, String color) { this.display = display; this.color = color; }
+        Rarity next() { Rarity[] v = values(); return v[(ordinal() + 1) % v.length]; }
+        Rarity previous() { Rarity[] v = values(); return v[(ordinal() - 1 + v.length) % v.length]; }
+        static Rarity parse(String s) {
+            try { return valueOf(s.toUpperCase(Locale.ROOT)); }
+            catch (Throwable ignored) { return COMMON; }
+        }
+    }
+
+    private enum GuiType { MAIN, REWARDS, REWARD_EDIT, PREVIEW, ROLL }
+
+    private static final class DailyGui implements InventoryHolder {
+        final GuiType type;
+        final int page;
+        final int rewardIndex;
+        DailyGui(GuiType type, int page, int rewardIndex) {
+            this.type = type;
+            this.page = page;
+            this.rewardIndex = rewardIndex;
+        }
+        @Override public Inventory getInventory() { return null; }
+    }
+
+    private static final class RollSession {
+        final Player player;
+        final Inventory inventory;
+        final Reward reward;
+        int step;
+        boolean awarded;
+        BukkitTask task;
+        RollSession(Player player, Inventory inventory, Reward reward) {
+            this.player = player;
+            this.inventory = inventory;
+            this.reward = reward;
+        }
+    }
+}
