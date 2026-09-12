@@ -1,0 +1,127 @@
+        if (address.isLinkLocalAddress() || address.isSiteLocalAddress() || address.isMulticastAddress()) return "R" + hash.substring(1);
+        return hash;
+    }
+
+    private String hashNetwork(InetAddress address) {
+        if (address == null) return null;
+        byte[] raw = address.getAddress().clone();
+        if (raw.length == 4) {
+            raw[3] = 0;
+        } else if (raw.length == 16) {
+            for (int i = 8; i < raw.length; i++) raw[i] = 0;
+        }
+        String marker = address.isLoopbackAddress() || address.isAnyLocalAddress() ? "LN:" : (address.isSiteLocalAddress() || address.isLinkLocalAddress() ? "RN:" : "PN:");
+        return marker + hmacBytes(raw);
+    }
+
+    private boolean serverOnlineMode() {
+        try {
+            Object server = Bukkit.class.getMethod("getServer").invoke(null);
+            Object result = server.getClass().getMethod("getOnlineMode").invoke(server);
+            return result instanceof Boolean b && b;
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private boolean detectProxyForwardingConfigured() {
+        try {
+            File plugins = getDataFolder().getParentFile();
+            File root = plugins == null ? null : plugins.getParentFile();
+            if (root == null) return false;
+            File paper = new File(root, "config/paper-global.yml");
+            if (paper.isFile()) {
+                String text = Files.readString(paper.toPath(), StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+                if (text.matches("(?s).*\\bvelocity\\s*:\\s*(?:\\r?\\n[ \\t]+[^\\r\\n]*)*?\\r?\\n[ \\t]+enabled\\s*:\\s*true\\b.*")) return true;
+            }
+            File spigot = new File(root, "spigot.yml");
+            if (spigot.isFile()) {
+                String text = Files.readString(spigot.toPath(), StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+                if (text.matches("(?s).*\\bbungeecord\\s*:\\s*true\\b.*")) return true;
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private boolean safeKnownBefore(UUID uuid) {
+        try { return database.firstSeen(uuid) > 0L; } catch (Throwable ignored) { return true; }
+    }
+
+    private String hmac(String value){return hmacBytes(value.getBytes(StandardCharsets.UTF_8));}
+    private String hmacBytes(byte[] value){try{Mac mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(networkSecret.getBytes(StandardCharsets.UTF_8),"HmacSHA256"));byte[] out=mac.doFinal(value);StringBuilder b=new StringBuilder();for(byte x:out)b.append(String.format("%02x",x));return b.toString();}catch(Exception e){throw new IllegalStateException(e);}}
+
+    private UUID knownUuid(String target){Player p=Bukkit.getPlayerExact(target);if(p!=null)return p.getUniqueId();try{OfflinePlayer op=Bukkit.getOfflinePlayer(target);if(op!=null&&op.hasPlayedBefore())return op.getUniqueId();}catch(Throwable ignored){}return null;}
+
+    private static String normalizeTarget(String s){s=s==null?"":s.trim();return limit(s,32);}
+    private static String normalizeReason(String s){return s==null||s.isBlank()?"[no reason provided]":limit(s.trim(),500);}
+    private static String join(String[] a,int from){if(a==null||from>=a.length)return "";StringBuilder b=new StringBuilder();for(int i=from;i<a.length;i++){if(i>from)b.append(' ');b.append(a[i]);}return b.toString();}
+    private static String canonicalLabel(String label){String l=label==null?"":label.toLowerCase(Locale.ROOT);int colon=l.lastIndexOf(':');if(colon>=0)l=l.substring(colon+1);return l;}
+    private static String actionLabel(String a){return switch(a){case "BAN"->"Ban";case "MUTE"->"Mute";case "KICK"->"Kick";case "WARN"->"Warn";case "BLACKLIST"->"Blacklist";case "REMOVE"->"Remove punishment";case "HISTORY"->"View history";case "WARNINGS"->"View warnings";default->a;};}
+    private static String prettyType(String a){return a.substring(0,1)+a.substring(1).toLowerCase(Locale.ROOT);}
+    private static String limit(String s,int n){return s.length()<=n?s:s.substring(0,n);}
+    private static String normalizeCsv(String s){StringJoiner j=new StringJoiner(",");for(String x:s.split(",")){x=x.trim().toLowerCase(Locale.ROOT);if(!x.isEmpty())j.add(x);}return j.toString();}
+    private static List<String> startsWith(List<String> values,String p){String q=p.toLowerCase(Locale.ROOT);List<String> out=new ArrayList<>();for(String v:values)if(v.startsWith(q))out.add(v);return out;}
+    private static long safeAdd(long a,long b){try{return Math.addExact(a,b);}catch(ArithmeticException e){return Long.MAX_VALUE;}}
+
+    private static long parseDuration(String raw){
+        if(raw==null)return Long.MIN_VALUE;String s=raw.trim().toLowerCase(Locale.ROOT);if(s.equals("forever")||s.equals("perm")||s.equals("permanent"))return -1L;if(s.isEmpty())return Long.MIN_VALUE;
+        long total=0;int i=0;boolean any=false;while(i<s.length()){int start=i;while(i<s.length()&&Character.isDigit(s.charAt(i)))i++;if(start==i)return Long.MIN_VALUE;long n;try{n=Long.parseLong(s.substring(start,i));}catch(Exception e){return Long.MIN_VALUE;}int u=i;while(i<s.length()&&Character.isLetter(s.charAt(i)))i++;String unit=s.substring(u,i);long mult=switch(unit){case "s"->1000L;case "m"->60_000L;case "h"->3_600_000L;case "d"->86_400_000L;case "w"->604_800_000L;case "mo"->2_592_000_000L;case "y"->31_536_000_000L;default->-1L;};if(mult<0)return Long.MIN_VALUE;try{total=Math.addExact(total,Math.multiplyExact(n,mult));}catch(ArithmeticException e){return Long.MAX_VALUE;}any=true;}return any?total:Long.MIN_VALUE;
+    }
+
+    private static String formatDuration(long ms){if(ms<0)return "forever";long sec=Math.max(0,ms/1000);long y=sec/31_536_000;sec%=31_536_000;long mo=sec/2_592_000;sec%=2_592_000;long w=sec/604_800;sec%=604_800;long d=sec/86_400;sec%=86_400;long h=sec/3600;sec%=3600;long m=sec/60;sec%=60;StringBuilder b=new StringBuilder();appendUnit(b,y,"y");appendUnit(b,mo,"mo");appendUnit(b,w,"w");appendUnit(b,d,"d");appendUnit(b,h,"h");appendUnit(b,m,"m");if(b.length()==0||sec>0)appendUnit(b,sec,"s");return b.toString().trim();}
+    private static void appendUnit(StringBuilder b,long n,String u){if(n>0){if(b.length()>0)b.append(' ');b.append(n).append(u);}}
+    private static String formatDate(long t){return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date(t));}
+    private static String stripColors(String s){return s==null?"":s.replaceAll("(?i)§[0-9A-FK-ORX]","");}
+    private static String miniToLegacy(String s){return s.replace("&0","§0").replace("&1","§1").replace("&2","§2").replace("&3","§3").replace("&4","§4").replace("&5","§5").replace("&6","§6").replace("&7","§7").replace("&8","§8").replace("&9","§9").replace("&a","§a").replace("&b","§b").replace("&c","§c").replace("&d","§d").replace("&e","§e").replace("&f","§f").replace("&l","§l").replace("&o","§o").replace("&n","§n").replace("&r","§r").replaceAll("<[^>]+>","");}
+
+    private ItemStack item(Material material,String name,String... lore){ItemStack item=new ItemStack(material);ItemMeta meta=item.getItemMeta();if(meta!=null){meta.setDisplayName(name);if(lore!=null&&lore.length>0)meta.setLore(Arrays.asList(lore));try{meta.addItemFlags(ItemFlag.values());}catch(Throwable ignored){}item.setItemMeta(meta);}return item;}
+    private void fill(Inventory inv,Material material,String name){for(int i=0;i<inv.getSize();i++)inv.setItem(i,item(material,name));}
+    private void set(Inventory inv,int slot,ItemStack item){inv.setItem(slot,item);}
+    private void closeUi(Player p){uiStates.remove(p.getUniqueId());p.closeInventory();}
+    private void sync(Runnable r){Bukkit.getScheduler().runTask(this,r);}
+    private void asyncError(CommandSender sender,Throwable t){getLogger().log(Level.WARNING,"Moderation operation failed",t);sync(()->sender.sendMessage(PREFIX+"§cOperation failed. Check console for details."));}
+    private static String randomSecret(){byte[] b=new byte[32];new SecureRandom().nextBytes(b);StringBuilder s=new StringBuilder();for(byte x:b)s.append(String.format("%02x",x));return s.toString();}
+
+    private record UiState(String screen,String action,String target,long duration,int page,String viewing){}
+    private record Prompt(String type,String action,String target,long duration){}
+    private record AltDecision(Punishment mainSanction,UUID mainUuid,String mainName,int score,boolean shouldAct,String evidence){}
+    private record IdentityCandidate(UUID uuid,String username){}
+    private record AddressIdentity(String exactHash,String networkHash,String scope){}
+    private record PreLoginSnapshot(String exactHash,String networkHash,String scope,boolean forwarded,boolean knownBefore,long loginAt){}
+    private record ModEvent(String id,String type,String payload,long createdAt){}
+    private record OnlineRef(UUID uuid,String name,String world,double x,double y,double z){}
+    private record KickPlan(UUID uuid,String message){}
+    private record BasePoint(String kind,String world,double x,double y,double z,long weight){}
+    private record HomePoint(String name,String world,double x,double y,double z){}
+    private record ContactStat(UUID uuid,int messages,long lastAt){}
+    private record WatchEntry(String id,UUID suspectUuid,String suspectName,UUID mainUuid,String mainName,int score,String evidence,long createdAt,long lastSeen,boolean active){}
+    private record AccountAgeInfo(Long createdAt,long checkedAt,String status){}
+    private record BehaviorProfile(Punishment sanction,List<BasePoint> anchors,List<ContactStat> contacts){}
+    private record SocialMatch(int score,String evidence){}
+    private record RtpLanding(String world,double x,double z,long landedAt){}
+    private static final class DwellState {
+        long startedAt;
+        long lastAt;
+        String anchor;
+        DwellState(long startedAt,long lastAt,String anchor){this.startedAt=startedAt;this.lastAt=lastAt;this.anchor=anchor;}
+    }
+
+    private static final class Punishment {
+        final String id,type; final UUID targetUuid,moderatorUuid; final String targetName,moderatorName,moderatorDisplay,reason; final long createdAt,expiresAt; final boolean active; final String parentId;
+        Punishment(String id,String type,UUID targetUuid,String targetName,UUID moderatorUuid,String moderatorName,String moderatorDisplay,String reason,long createdAt,long expiresAt,boolean active,String parentId){this.id=id;this.type=type;this.targetUuid=targetUuid;this.targetName=targetName;this.moderatorUuid=moderatorUuid;this.moderatorName=moderatorName;this.moderatorDisplay=moderatorDisplay;this.reason=reason;this.createdAt=createdAt;this.expiresAt=expiresAt;this.active=active;this.parentId=parentId;}
+        boolean isActive(long now){return active&&(expiresAt==0||expiresAt>now);} String targetKey(){return targetName.toLowerCase(Locale.ROOT);}
+    }
+
+    private static final class Settings {
+        final String serverName,discordUrl,altMode;
+        final Set<String> moderatorGroups,alertGroups,blockedMuteCommands,watchExcludedWorlds;
+        final boolean requireReasons,behaviorWatchEnabled,accountAgeGate;
+        final int watchBaseRadius,watchGeoRadius,watchThreshold;
+
+        Settings(String serverName,String discordUrl,Set<String> moderatorGroups,Set<String> alertGroups,String altMode,
+                 boolean requireReasons,Set<String> blocked,boolean behaviorWatchEnabled,boolean accountAgeGate,
+                 int watchBaseRadius,int watchGeoRadius,int watchThreshold,Set<String> watchExcludedWorlds){
+            this.serverName=serverName;this.discordUrl=discordUrl;this.moderatorGroups=moderatorGroups;this.alertGroups=alertGroups;
+            this.altMode=altMode;this.requireReasons=requireReasons;this.blockedMuteCommands=blocked;
+            this.behaviorWatchEnabled=behaviorWatchEnabled;this.accountAgeGate=accountAgeGate;
+            this.watchBaseRadius=watchBaseRadius;this.watchGeoRadius=watchGeoRadius;this.watchThreshold=watchThreshold;
