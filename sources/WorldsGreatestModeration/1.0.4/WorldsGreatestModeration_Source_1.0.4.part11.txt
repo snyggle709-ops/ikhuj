@@ -1,0 +1,92 @@
+        void insertPunishment(Punishment p)throws SQLException{try(Connection c=open();PreparedStatement q=c.prepareStatement("INSERT INTO wgm_punishments(id,type,target_uuid,target_name,target_key,moderator_uuid,moderator_name,moderator_display,reason,created_at,expires_at,active,parent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")){int i=1;q.setString(i++,p.id);q.setString(i++,p.type);q.setString(i++,p.targetUuid==null?null:p.targetUuid.toString());q.setString(i++,p.targetName);q.setString(i++,p.targetKey());q.setString(i++,p.moderatorUuid==null?null:p.moderatorUuid.toString());q.setString(i++,p.moderatorName);q.setString(i++,p.moderatorDisplay);q.setString(i++,p.reason);q.setLong(i++,p.createdAt);q.setLong(i++,p.expiresAt);q.setBoolean(i++,p.active);q.setString(i,p.parentId);q.executeUpdate();}}
+        void insertAudit(String type,UUID targetUuid,String target,String modName,String modDisplay,String reason)throws SQLException{Punishment p=new Punishment(UUID.randomUUID().toString(),type,targetUuid,target,null,modName,modDisplay,reason,System.currentTimeMillis(),System.currentTimeMillis(),false,null);insertPunishment(p);}
+        Punishment findStrongestActive(UUID uuid,String name,Set<String> types,long now)throws SQLException{List<Punishment> list=new ArrayList<>();StringBuilder in=new StringBuilder();for(int i=0;i<types.size();i++){if(i>0)in.append(',');in.append('?');}String sql="SELECT * FROM wgm_punishments WHERE active=? AND (expires_at=0 OR expires_at>?) AND type IN ("+in+") AND (target_key=?"+(uuid!=null?" OR target_uuid=?":"")+")";try(Connection c=open();PreparedStatement p=c.prepareStatement(sql)){int i=1;p.setBoolean(i++,true);p.setLong(i++,now);for(String t:types)p.setString(i++,t);p.setString(i++,name.toLowerCase(Locale.ROOT));if(uuid!=null)p.setString(i,uuid.toString());try(ResultSet r=p.executeQuery()){while(r.next())list.add(readPunishment(r));}}Punishment best=null;for(Punishment p:list)if(best==null||rank(p.type)>rank(best.type)||(rank(p.type)==rank(best.type)&&p.createdAt>best.createdAt))best=p;return best;}
+        int deactivate(String type,UUID uuid,String name)throws SQLException{String sql="UPDATE wgm_punishments SET active=? WHERE active=? AND type=? AND (target_key=?"+(uuid!=null?" OR target_uuid=?":"")+")";try(Connection c=open();PreparedStatement p=c.prepareStatement(sql)){int i=1;p.setBoolean(i++,false);p.setBoolean(i++,true);p.setString(i++,type);p.setString(i++,name.toLowerCase(Locale.ROOT));if(uuid!=null)p.setString(i,uuid.toString());return p.executeUpdate();}}
+        int deactivateInheritedBans(UUID mainUuid,String mainName)throws SQLException{String sql="SELECT id FROM wgm_punishments WHERE type='BAN' AND (target_key=?"+(mainUuid!=null?" OR target_uuid=?":"")+") ORDER BY created_at DESC";try(Connection c=open();PreparedStatement find=c.prepareStatement(sql)){int i=1;find.setString(i++,mainName.toLowerCase(Locale.ROOT));if(mainUuid!=null)find.setString(i,mainUuid.toString());try(ResultSet r=find.executeQuery()){if(!r.next())return 0;return deactivateInheritedBansByParent(r.getString(1));}}}
+        int deactivateInheritedBansByParent(String parent)throws SQLException{try(Connection c=open();PreparedStatement p=c.prepareStatement("UPDATE wgm_punishments SET active=? WHERE active=? AND type='BAN' AND parent_id=?")){p.setBoolean(1,false);p.setBoolean(2,true);p.setString(3,parent);return p.executeUpdate();}}
+        int deactivateWarning(UUID targetUuid,String target,String id)throws SQLException{String sql="UPDATE wgm_punishments SET active=? WHERE active=? AND type='WARN' AND id=? AND (target_key=?"+(targetUuid!=null?" OR target_uuid=?":"")+")";try(Connection c=open();PreparedStatement p=c.prepareStatement(sql)){int i=1;p.setBoolean(i++,false);p.setBoolean(i++,true);p.setString(i++,id);p.setString(i++,target.toLowerCase(Locale.ROOT));if(targetUuid!=null)p.setString(i,targetUuid.toString());return p.executeUpdate();}}
+        int deactivatePunishmentById(String id)throws SQLException{try(Connection c=open();PreparedStatement p=c.prepareStatement("UPDATE wgm_punishments SET active=? WHERE active=? AND id=?")){p.setBoolean(1,false);p.setBoolean(2,true);p.setString(3,id);return p.executeUpdate();}}
+        List<Punishment> history(UUID uuid,String name,int limit)throws SQLException{return queryPunishments(uuid,name,false,limit);}
+        List<Punishment> activeWarnings(UUID uuid,String name)throws SQLException{List<Punishment> all=queryPunishments(uuid,name,true,200);all.removeIf(p->!p.type.equals("WARN")||!p.isActive(System.currentTimeMillis()));return all;}
+        private List<Punishment> queryPunishments(UUID uuid,String name,boolean activeOnly,int limit)throws SQLException{String sql="SELECT * FROM wgm_punishments WHERE "+(activeOnly?"active=? AND ":"")+"(target_key=?"+(uuid!=null?" OR target_uuid=?":"")+") ORDER BY created_at DESC";List<Punishment> out=new ArrayList<>();try(Connection c=open();PreparedStatement p=c.prepareStatement(sql)){int i=1;if(activeOnly)p.setBoolean(i++,true);p.setString(i++,name.toLowerCase(Locale.ROOT));if(uuid!=null)p.setString(i,uuid.toString());try(ResultSet r=p.executeQuery()){while(r.next()&&out.size()<limit)out.add(readPunishment(r));}}return out;}
+        List<Punishment> getAllActiveNetwork(long now)throws SQLException{List<Punishment> out=new ArrayList<>();try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT * FROM wgm_punishments WHERE active=? AND (expires_at=0 OR expires_at>?) AND type IN ('BLACKLIST','BAN','MUTE')")){p.setBoolean(1,true);p.setLong(2,now);try(ResultSet r=p.executeQuery()){while(r.next())out.add(readPunishment(r));}}return out;}
+        void cleanupExpired(long now)throws SQLException{try(Connection c=open()){try(PreparedStatement p=c.prepareStatement("UPDATE wgm_punishments SET active=? WHERE active=? AND expires_at>0 AND expires_at<=? AND type IN ('BAN','MUTE','BLACKLIST','WARN')")){p.setBoolean(1,false);p.setBoolean(2,true);p.setLong(3,now);p.executeUpdate();}try(PreparedStatement p=c.prepareStatement("DELETE FROM wgm_logins WHERE created_at<?")){p.setLong(1,now-90L*24L*60L*60L*1000L);p.executeUpdate();}try(PreparedStatement p=c.prepareStatement("UPDATE wgm_sessions SET left_at=joined_at WHERE left_at=0 AND joined_at<?")){p.setLong(1,now-24L*60L*60L*1000L);p.executeUpdate();}try(PreparedStatement p=c.prepareStatement("DELETE FROM wgm_sessions WHERE joined_at<?")){p.setLong(1,now-120L*24L*60L*60L*1000L);p.executeUpdate();}try(PreparedStatement p=c.prepareStatement("DELETE FROM wgm_live_presence WHERE updated_at<?")){p.setLong(1,now-2L*60L*1000L);p.executeUpdate();}}}
+        Punishment readPunishment(ResultSet r)throws SQLException{return new Punishment(r.getString("id"),r.getString("type"),uuid(r.getString("target_uuid")),r.getString("target_name"),uuid(r.getString("moderator_uuid")),r.getString("moderator_name"),r.getString("moderator_display"),r.getString("reason"),r.getLong("created_at"),r.getLong("expires_at"),r.getBoolean("active"),r.getString("parent_id"));}
+        Punishment findPunishmentById(String id)throws SQLException{try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT * FROM wgm_punishments WHERE id=?")){p.setString(1,id);try(ResultSet r=p.executeQuery()){return r.next()?readPunishment(r):null;}}}
+        void observe(UUID uuid, String name, String ipHash, String networkHash, String fp) throws SQLException {
+            if (uuid == null) return;
+            long now = System.currentTimeMillis();
+            try (Connection c = open()) {
+                String where = ipHash == null ? "ip_hash IS NULL" : "ip_hash=?";
+                try (PreparedStatement find = c.prepareStatement("SELECT id,fingerprint_hash,network_hash FROM wgm_observations WHERE uuid=? AND " + where + " ORDER BY last_seen DESC")) {
+                    find.setString(1, uuid.toString());
+                    if (ipHash != null) find.setString(2, ipHash);
+                    try (ResultSet r = find.executeQuery()) {
+                        if (r.next()) {
+                            String id = r.getString(1);
+                            String oldFp = r.getString(2);
+                            String oldNetwork = r.getString(3);
+                            try (PreparedStatement u = c.prepareStatement("UPDATE wgm_observations SET username_display=?,username_key=?,network_hash=?,fingerprint_hash=?,last_seen=?,visits=visits+1 WHERE id=?")) {
+                                u.setString(1, name);
+                                u.setString(2, name.toLowerCase(Locale.ROOT));
+                                u.setString(3, networkHash == null ? oldNetwork : networkHash);
+                                u.setString(4, fp == null ? oldFp : fp);
+                                u.setLong(5, now);
+                                u.setString(6, id);
+                                u.executeUpdate();
+                                return;
+                            }
+                        }
+                    }
+                }
+                try (PreparedStatement q = c.prepareStatement("INSERT INTO wgm_observations(id,uuid,username_display,username_key,ip_hash,network_hash,fingerprint_hash,first_seen,last_seen,visits) VALUES(?,?,?,?,?,?,?,?,?,?)")) {
+                    q.setString(1, UUID.randomUUID().toString());
+                    q.setString(2, uuid.toString());
+                    q.setString(3, name);
+                    q.setString(4, name.toLowerCase(Locale.ROOT));
+                    q.setString(5, ipHash);
+                    q.setString(6, networkHash);
+                    q.setString(7, fp);
+                    q.setLong(8, now);
+                    q.setLong(9, now);
+                    q.setInt(10, 1);
+                    q.executeUpdate();
+                }
+            }
+        }
+
+        void recordLogin(UUID uuid, String name, String ipHash, String networkHash, String fp, long createdAt, boolean allowed) throws SQLException {
+            if (uuid == null) return;
+            try (Connection c = open(); PreparedStatement p = c.prepareStatement("INSERT INTO wgm_logins(id,uuid,username_display,ip_hash,network_hash,fingerprint_hash,created_at,allowed) VALUES(?,?,?,?,?,?,?,?)")) {
+                p.setString(1, UUID.randomUUID().toString());
+                p.setString(2, uuid.toString());
+                p.setString(3, name);
+                p.setString(4, ipHash);
+                p.setString(5, networkHash);
+                p.setString(6, fp);
+                p.setLong(7, createdAt);
+                p.setBoolean(8, allowed);
+                p.executeUpdate();
+            }
+        }
+
+        void enrichRecentLogin(UUID uuid, long createdAt, String fp) throws SQLException {
+            if (uuid == null || fp == null) return;
+            try (Connection c = open(); PreparedStatement p = c.prepareStatement("UPDATE wgm_logins SET fingerprint_hash=? WHERE uuid=? AND created_at>=? AND created_at<=? AND fingerprint_hash IS NULL")) {
+                p.setString(1, fp);
+                p.setString(2, uuid.toString());
+                p.setLong(3, createdAt - 5_000L);
+                p.setLong(4, createdAt + 10_000L);
+                p.executeUpdate();
+            }
+        }
+
+        void startSession(UUID uuid, String ipHash, String networkHash, String fp, long joinedAt) throws SQLException {
+            if (uuid == null) return;
+            try (Connection c = open(); PreparedStatement p = c.prepareStatement("INSERT INTO wgm_sessions(id,uuid,ip_hash,network_hash,fingerprint_hash,joined_at,left_at) VALUES(?,?,?,?,?,?,?)")) {
+                p.setString(1, UUID.randomUUID().toString()); p.setString(2, uuid.toString()); p.setString(3, ipHash); p.setString(4, networkHash); p.setString(5, fp); p.setLong(6, joinedAt); p.setLong(7, 0L); p.executeUpdate();
+            }
+        }
+
+        void endOpenSessions(UUID uuid, long leftAt) throws SQLException {
+            if (uuid == null) return;
