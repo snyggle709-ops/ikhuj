@@ -1,0 +1,105 @@
+                        double dx=rs.getDouble(2)-x,dz=rs.getDouble(3)-z;
+                        if(dx*dx+dz*dz<=r2){count++;if(count>=3)return count;}
+                    }
+                }
+            }
+            return count;
+        }
+
+        void recordMessageEdge(UUID sender,UUID recipient,long now)throws SQLException {
+            if(sender==null||recipient==null||sender.equals(recipient))return;
+            try(Connection c=open();PreparedStatement u=c.prepareStatement("UPDATE wgm_message_edges SET messages=messages+1,last_at=? WHERE sender_uuid=? AND recipient_uuid=?")){
+                u.setLong(1,now);u.setString(2,sender.toString());u.setString(3,recipient.toString());
+                if(u.executeUpdate()==0){
+                    try(PreparedStatement q=c.prepareStatement("INSERT INTO wgm_message_edges(sender_uuid,recipient_uuid,messages,last_at) VALUES(?,?,?,?)")){
+                        q.setString(1,sender.toString());q.setString(2,recipient.toString());q.setInt(3,1);q.setLong(4,now);
+                        try{q.executeUpdate();}catch(SQLException race){try(PreparedStatement retry=c.prepareStatement("UPDATE wgm_message_edges SET messages=messages+1,last_at=? WHERE sender_uuid=? AND recipient_uuid=?")){retry.setLong(1,now);retry.setString(2,sender.toString());retry.setString(3,recipient.toString());retry.executeUpdate();}}
+                    }
+                }
+            }
+        }
+
+        List<ContactStat> topContacts(UUID sender,int limitCount)throws SQLException {
+            List<ContactStat> out=new ArrayList<>();
+            if(sender==null)return out;
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT recipient_uuid,messages,last_at FROM wgm_message_edges WHERE sender_uuid=? ORDER BY messages DESC,last_at DESC")){
+                p.setString(1,sender.toString());
+                try(ResultSet r=p.executeQuery()){
+                    while(r.next()&&out.size()<limitCount){
+                        UUID u=uuid(r.getString(1));if(u!=null)out.add(new ContactStat(u,r.getInt(2),r.getLong(3)));
+                    }
+                }
+            }
+            return out;
+        }
+
+        boolean upsertWatchEntry(UUID suspect,String suspectName,UUID main,String mainName,int score,String evidence,long now)throws SQLException {
+            if(suspect==null||main==null||suspect.equals(main))return false;
+            String existing=null;int oldScore=0;
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT id,score FROM wgm_watchlist WHERE suspect_uuid=? AND main_uuid=? AND active=? ORDER BY last_seen DESC")){
+                p.setString(1,suspect.toString());p.setString(2,main.toString());p.setBoolean(3,true);
+                try(ResultSet r=p.executeQuery()){if(r.next()){existing=r.getString(1);oldScore=r.getInt(2);}}
+            }
+            if(existing!=null){
+                try(Connection c=open();PreparedStatement p=c.prepareStatement("UPDATE wgm_watchlist SET suspect_name=?,main_name=?,score=?,evidence=?,last_seen=? WHERE id=?")){
+                    p.setString(1,limit(suspectName,64));p.setString(2,limit(mainName,64));p.setInt(3,Math.max(oldScore,score));p.setString(4,limit(evidence,950));p.setLong(5,now);p.setString(6,existing);p.executeUpdate();
+                }
+                return false;
+            }
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("INSERT INTO wgm_watchlist(id,suspect_uuid,suspect_name,main_uuid,main_name,score,evidence,created_at,last_seen,active,dismissed_by,dismissed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")){
+                p.setString(1,UUID.randomUUID().toString());p.setString(2,suspect.toString());p.setString(3,limit(suspectName,64));p.setString(4,main.toString());p.setString(5,limit(mainName,64));p.setInt(6,score);p.setString(7,limit(evidence,950));p.setLong(8,now);p.setLong(9,now);p.setBoolean(10,true);p.setString(11,null);p.setNull(12,Types.BIGINT);p.executeUpdate();
+            }
+            return true;
+        }
+
+        List<WatchEntry> listWatchlist(int limitCount)throws SQLException {
+            List<WatchEntry> out=new ArrayList<>();
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT id,suspect_uuid,suspect_name,main_uuid,main_name,score,evidence,created_at,last_seen,active FROM wgm_watchlist WHERE active=? ORDER BY score DESC,last_seen DESC")){
+                p.setBoolean(1,true);
+                try(ResultSet r=p.executeQuery()){
+                    while(r.next()&&out.size()<limitCount){
+                        out.add(new WatchEntry(r.getString(1),uuid(r.getString(2)),r.getString(3),uuid(r.getString(4)),r.getString(5),r.getInt(6),r.getString(7),r.getLong(8),r.getLong(9),r.getBoolean(10)));
+                    }
+                }
+            }
+            return out;
+        }
+
+        void dismissWatchEntry(String id,String moderator,long now)throws SQLException {
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("UPDATE wgm_watchlist SET active=?,dismissed_by=?,dismissed_at=? WHERE id=?")){
+                p.setBoolean(1,false);p.setString(2,limit(moderator,64));p.setLong(3,now);p.setString(4,id);p.executeUpdate();
+            }
+        }
+
+        AccountAgeInfo accountAgeInfo(UUID uuid)throws SQLException {
+            if(uuid==null)return null;
+            try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT created_at,checked_at,status FROM wgm_account_age WHERE uuid=?")){
+                p.setString(1,uuid.toString());
+                try(ResultSet r=p.executeQuery()){
+                    if(!r.next())return null;
+                    Object rawCreated=r.getObject(1);
+                    Long created=rawCreated instanceof Number n?n.longValue():null;
+                    return new AccountAgeInfo(created,r.getLong(2),r.getString(3));
+                }
+            }
+        }
+
+        void storeAccountAge(UUID uuid,Long createdAt,long checkedAt,String status)throws SQLException {
+            if(uuid==null)return;
+            try(Connection c=open();PreparedStatement u=c.prepareStatement("UPDATE wgm_account_age SET created_at=?,checked_at=?,status=? WHERE uuid=?")){
+                if(createdAt==null)u.setNull(1,Types.BIGINT);else u.setLong(1,createdAt);
+                u.setLong(2,checkedAt);u.setString(3,status);u.setString(4,uuid.toString());
+                if(u.executeUpdate()==0){
+                    try(PreparedStatement q=c.prepareStatement("INSERT INTO wgm_account_age(uuid,created_at,checked_at,status) VALUES(?,?,?,?)")){
+                        q.setString(1,uuid.toString());if(createdAt==null)q.setNull(2,Types.BIGINT);else q.setLong(2,createdAt);q.setLong(3,checkedAt);q.setString(4,status);
+                        try{q.executeUpdate();}catch(SQLException race){}
+                    }
+                }
+            }
+        }
+
+        String insertEvent(String type,String payload)throws SQLException{String id=UUID.randomUUID().toString();try(Connection c=open();PreparedStatement p=c.prepareStatement("INSERT INTO wgm_events(id,event_type,payload,created_at) VALUES(?,?,?,?)")){p.setString(1,id);p.setString(2,type);p.setString(3,limit(payload,900));p.setLong(4,System.currentTimeMillis());p.executeUpdate();}return id;}
+        List<ModEvent> eventsSince(long since)throws SQLException{List<ModEvent> out=new ArrayList<>();try(Connection c=open();PreparedStatement p=c.prepareStatement("SELECT id,event_type,payload,created_at FROM wgm_events WHERE created_at>=? ORDER BY created_at ASC")){p.setLong(1,since);try(ResultSet r=p.executeQuery()){while(r.next())out.add(new ModEvent(r.getString(1),r.getString(2),r.getString(3),r.getLong(4)));}}return out;}
+        static UUID uuid(String s){if(s==null||s.isBlank())return null;try{return UUID.fromString(s);}catch(Exception e){return null;}}
+    }
+}
