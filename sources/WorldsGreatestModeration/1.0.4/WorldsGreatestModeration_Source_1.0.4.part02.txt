@@ -1,0 +1,236 @@
+            profiles.put(rootUuid, new BehaviorProfile(root, anchors, contacts));
+        }
+
+        for (OnlineRef suspect : online) {
+            if (suspect.uuid == null) continue;
+            Punishment direct = database.findStrongestActive(suspect.uuid, suspect.name, Set.of("BLACKLIST", "BAN"), now);
+            if (direct != null) continue;
+
+            long suspectFirstSeen = database.firstSeen(suspect.uuid);
+            List<ContactStat> suspectContacts = database.topContacts(suspect.uuid, 5);
+            boolean rtpExcluded = isRtpLocationExcluded(suspect, now);
+
+            for (Map.Entry<UUID, BehaviorProfile> e : profiles.entrySet()) {
+                UUID mainUuid = e.getKey();
+                if (mainUuid.equals(suspect.uuid)) continue;
+                BehaviorProfile profile = e.getValue();
+
+                int score = 0;
+                List<String> evidence = new ArrayList<>();
+                boolean joinedAfter = suspectFirstSeen > 0L && suspectFirstSeen >= profile.sanction.createdAt;
+                if (joinedAfter) {
+                    score += 10;
+                    evidence.add("first-seen-after-" + profile.sanction.type.toLowerCase(Locale.ROOT));
+                }
+
+                SocialMatch social = socialMatch(profile.contacts, suspectContacts);
+                if (social.score > 0) {
+                    score += social.score;
+                    evidence.add(social.evidence);
+                }
+
+                int locationScore = 0;
+                String locationEvidence = null;
+                if (!rtpExcluded && !isWatchExcludedWorld(suspect.world)) {
+                    BasePoint nearestBase = nearestAnchor(suspect, profile.anchors, settings.watchBaseRadius, true);
+                    if (nearestBase != null) {
+                        int others = database.livePlayersNear(nearestBase.world, nearestBase.x, nearestBase.z,
+                                settings.watchBaseRadius, now - 30_000L, suspect.uuid, mainUuid);
+                        if (others < 3) {
+                            long dwell = updateDwell(suspect.uuid, mainUuid, nearestBase, now);
+                            if (dwell >= BASE_DWELL_REQUIRED_MS) {
+                                locationScore = 45;
+                                locationEvidence = "old-base-dwell=" + formatDuration(dwell) + "@" + compactPoint(nearestBase)
+                                        + ",other-players=" + others;
+                            }
+                        } else {
+                            resetDwellPair(suspect.uuid, mainUuid);
+                        }
+                    } else {
+                        resetDwellPair(suspect.uuid, mainUuid);
+                    }
+
+                    if (locationScore == 0) {
+                        BasePoint near = nearestAnchor(suspect, profile.anchors, settings.watchGeoRadius, false);
+                        if (near != null) {
+                            int others = database.livePlayersNear(near.world, near.x, near.z,
+                                    Math.min(settings.watchGeoRadius, 128), now - 30_000L, suspect.uuid, mainUuid);
+                            if (others < 3) {
+                                double dist = horizontalDistance(suspect.x, suspect.z, near.x, near.z);
+                                locationScore = 20;
+                                locationEvidence = "near-old-area=" + (int)Math.round(dist) + "b@" + compactPoint(near);
+                            }
+                        }
+                    }
+                } else {
+                    resetDwellPair(suspect.uuid, mainUuid);
+                }
+
+                if (locationScore > 0) {
+                    score += locationScore;
+                    evidence.add(locationEvidence);
+                }
+
+                if (score < settings.watchThreshold) continue;
+                // Prevent a generic "joined after sanction" context point from creating an entry by itself.
+                if (social.score == 0 && locationScore == 0) continue;
+
+                String evidenceText = String.join(",", evidence);
+                boolean created = database.upsertWatchEntry(suspect.uuid, suspect.name, mainUuid,
+                        profile.sanction.targetName, score, evidenceText, now);
+                if (created) {
+                    getLogger().info("Behavior watch: " + suspect.name + " -> " + profile.sanction.targetName
+                            + " | score=" + score + " | REVIEW ONLY | " + evidenceText);
+                }
+            }
+        }
+    }
+
+    private SocialMatch socialMatch(List<ContactStat> mainContacts, List<ContactStat> suspectContacts) throws SQLException {
+        if (mainContacts.isEmpty() || suspectContacts.isEmpty()) return new SocialMatch(0, "");
+        Map<UUID, ContactStat> suspectMap = new HashMap<>();
+        for (ContactStat c : suspectContacts) suspectMap.put(c.uuid, c);
+        List<String> shared = new ArrayList<>();
+        int sharedCount = 0;
+        boolean sharedMainTop = false;
+
+        for (int i = 0; i < mainContacts.size(); i++) {
+            ContactStat main = mainContacts.get(i);
+            ContactStat suspect = suspectMap.get(main.uuid);
+            if (suspect == null || main.messages < 3 || suspect.messages < 3) continue;
+            sharedCount++;
+            if (i == 0) sharedMainTop = true;
+            String name;
+            try { name = database.latestName(main.uuid); } catch (Throwable t) { name = main.uuid.toString(); }
+            shared.add(name + "(" + suspect.messages + " msgs)");
+        }
+
+        if (sharedCount == 0) return new SocialMatch(0, "");
+        int score = sharedCount >= 2 ? 40 : (sharedMainTop ? 30 : 22);
+        return new SocialMatch(score, "shared-frequent-contact=" + String.join("+", shared));
+    }
+
+    private BasePoint nearestAnchor(OnlineRef suspect, List<BasePoint> anchors, int radius, boolean baseOnly) {
+        BasePoint best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (BasePoint point : anchors) {
+            if (baseOnly && "LAST".equals(point.kind)) continue;
+            if (!point.world.equalsIgnoreCase(suspect.world)) continue;
+            double d = horizontalDistance(suspect.x, suspect.z, point.x, point.z);
+            if (d <= radius && d < bestDistance) {
+                bestDistance = d;
+                best = point;
+            }
+        }
+        return best;
+    }
+
+    private long updateDwell(UUID suspect, UUID main, BasePoint point, long now) {
+        String key = suspect + "|" + main;
+        String anchor = point.kind + "|" + point.world.toLowerCase(Locale.ROOT) + "|" + Math.round(point.x / 16.0) + "|" + Math.round(point.z / 16.0);
+        DwellState state = dwellStates.get(key);
+        if (state == null || !anchor.equals(state.anchor) || now - state.lastAt > BEHAVIOR_SAMPLE_MS * 3L) {
+            state = new DwellState(now, now, anchor);
+            dwellStates.put(key, state);
+            return 0L;
+        }
+        state.lastAt = now;
+        return Math.max(0L, now - state.startedAt);
+    }
+
+    private void resetDwellPair(UUID suspect, UUID main) {
+        dwellStates.remove(suspect + "|" + main);
+    }
+
+    private static double horizontalDistance(double ax, double az, double bx, double bz) {
+        double dx = ax - bx, dz = az - bz;
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    private static String compactPoint(BasePoint p) {
+        return p.kind.toLowerCase(Locale.ROOT) + ":" + p.world + ":" + (int)Math.round(p.x) + "," + (int)Math.round(p.z);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInventoryClick(InventoryClickEvent event) {
+        HumanEntity human = event.getWhoClicked();
+        if (!(human instanceof Player player)) return;
+        UiState state = uiStates.get(player.getUniqueId());
+        if (state == null) return;
+        String title = event.getView().getTitle();
+        if (title == null || !title.startsWith("§0WGM •")) return;
+        event.setCancelled(true);
+        int slot = event.getRawSlot();
+        if (slot < 0 || slot >= event.getView().getTopInventory().getSize()) return;
+        boolean rightClick = event.isRightClick();
+        // Bukkit/Paper inventory transitions should occur outside the click callback itself.
+        sync(() -> handleUiClick(player, state, slot, rightClick));
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInventoryDrag(InventoryDragEvent event) {
+        HumanEntity human = event.getWhoClicked();
+        if (!(human instanceof Player player)) return;
+        if (uiStates.containsKey(player.getUniqueId()) && event.getView().getTitle().startsWith("§0WGM •")) event.setCancelled(true);
+    }
+
+    private void dispatch(CommandSender sender, String label, String[] args) {
+        if (!ready) {
+            sender.sendMessage(PREFIX + "§cPlugin storage is not ready. Check the console.");
+            return;
+        }
+        if (label.equals("ban-ip") || label.equals("ipban") || label.equals("pardon-ip")) {
+            sender.sendMessage(PREFIX + "§cIP moderation is intentionally disabled. Use account moderation so shared households are not punished together.");
+            return;
+        }
+        if (label.equals("tempban")) label = "ban";
+        if (label.equals("tempmute")) label = "mute";
+        if (label.equals("pardon")) label = "unban";
+
+        if (label.equals("warnings")) {
+            if (args.length == 0) {
+                if (!(sender instanceof Player p)) { sender.sendMessage(PREFIX + "§cConsole must specify a player."); return; }
+                openWarningsAsync(p, p.getName());
+                return;
+            }
+            if (!isModerator(sender)) { noPermission(sender); return; }
+            if (!(sender instanceof Player p)) { sendWarningsText(sender, args[0]); return; }
+            openWarningsAsync(p, args[0]);
+            return;
+        }
+        if (label.equals("moderatorhelp")) {
+            moderatorHelp(sender);
+            return;
+        }
+        if (label.equals("moderate")) {
+            if (!isModerator(sender)) { noPermission(sender); return; }
+            if (!(sender instanceof Player p)) { sender.sendMessage(PREFIX + "§cThe moderation UI requires a player. Commands still work from console."); return; }
+            openMain(p);
+            return;
+        }
+        if (label.equals("config")) {
+            if (!(sender instanceof Player p) || !p.isOp()) { sender.sendMessage(PREFIX + "§c/config is OP-only."); return; }
+            openConfig(p);
+            return;
+        }
+        if (label.equals("watchlist")) {
+            if (!isModerator(sender)) { noPermission(sender); return; }
+            if (!(sender instanceof Player p)) { sendWatchlistText(sender); return; }
+            openWatchlistAsync(p, 0);
+            return;
+        }
+        if (label.equals("viewmodhistory")) {
+            if (!isModerator(sender)) { noPermission(sender); return; }
+            if (args.length < 1) { sender.sendMessage(PREFIX + "§cUsage: /viewmodhistory <username>"); return; }
+            if (sender instanceof Player p) openHistoryAsync(p, args[0]); else sendHistoryText(sender, args[0]);
+            return;
+        }
+
+        if (!isModerator(sender)) { noPermission(sender); return; }
+        switch (label) {
+            case "ban" -> commandTimed(sender, "BAN", args, "/ban <user> <10s/10m/1h/1d/1w/1mo/1y/forever> [reason]");
+            case "mute" -> commandTimed(sender, "MUTE", args, "/mute <user> <duration> [reason]");
+            case "kick" -> commandSimple(sender, "KICK", args, "/kick <user> [reason]");
+            case "blacklist" -> commandTimed(sender, "BLACKLIST", args, "/blacklist <user> <duration> [reason]");
+            case "warn" -> commandTimed(sender, "WARN", args, "/warn <user> <duration> [reason]");
+            case "unban" -> commandRevoke(sender, "BAN", args, "/unban <user> [reason]");
