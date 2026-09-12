@@ -1,0 +1,137 @@
+                if(reason!=null){if(settings.requireReasons&&reason.isBlank()){player.sendMessage(PREFIX+"§cA reason is required.");return;}performUiAction(player,state.action,state.target,state.duration,normalizeReason(reason));return;}
+                if(slot==22){player.closeInventory();prompts.put(player.getUniqueId(),new Prompt("REASON",state.action,state.target,state.duration));player.sendMessage(PREFIX+"§eType the moderation reason in chat, or §fcancel§e.");}
+            }
+            case "REMOVE" -> {
+                if(slot==18){openTarget(player,"REMOVE",0);return;}
+                if(slot==10)submitRevokeUi(player,"BAN",state.target);
+                else if(slot==12)submitRevokeUi(player,"MUTE",state.target);
+                else if(slot==14)submitRevokeUi(player,"BLACKLIST",state.target);
+                else if(slot==16)openWarningsAsync(player,state.target);
+            }
+            case "HISTORY" -> {
+                if(slot==45){openMain(player);return;} if(slot==53){closeUi(player);return;}
+                if(slot==46&&state.page>0){openHistory(player,state.target,state.page-1);return;} if(slot==52){openHistory(player,state.target,state.page+1);return;}
+                if(slot>=0&&slot<36&&rightClick){List<Punishment> list=historyCache.getOrDefault(player.getUniqueId(),Collections.emptyList());int idx=state.page*36+slot;if(idx<list.size()){Punishment p=list.get(idx);revokeHistoryItem(player,p,state.target);}}
+            }
+            case "WARNINGS" -> {
+                if(slot==45){ if(isModerator(player))openMain(player); else closeUi(player); return;} if(slot==53){closeUi(player);return;}
+                if(slot==46&&state.page>0){openWarnings(player,state.target,state.page-1);return;} if(slot==52){openWarnings(player,state.target,state.page+1);return;}
+                if(slot>=0&&slot<36&&rightClick&&isModerator(player)){List<Punishment> list=warningsCache.getOrDefault(player.getUniqueId(),Collections.emptyList());int idx=state.page*36+slot;if(idx<list.size()){Punishment p=list.get(idx);UUID targetUuid=p.targetUuid;Bukkit.getScheduler().runTaskAsynchronously(this,()->{try{database.deactivatePunishmentById(p.id);List<Punishment> fresh=database.activeWarnings(targetUuid,state.target);warningsCache.put(player.getUniqueId(),fresh);sync(()->openWarnings(player,state.target,state.page));}catch(Throwable t){asyncError(player,t);}});}}
+            }
+            case "WATCHLIST" -> {
+                if(slot==45){openMain(player);return;} if(slot==53){closeUi(player);return;}
+                if(slot==46&&state.page>0){openWatchlistAsync(player,state.page-1);return;}
+                if(slot==52){openWatchlistAsync(player,state.page+1);return;}
+                if(slot>=0&&slot<36){
+                    List<WatchEntry> list=watchlistCache.getOrDefault(player.getUniqueId(),Collections.emptyList());
+                    int idx=state.page*36+slot;
+                    if(idx<list.size()){
+                        WatchEntry entry=list.get(idx);
+                        if(rightClick) dismissWatchEntry(player,entry,state.page);
+                        else openHistoryAsync(player,entry.suspectName);
+                    }
+                }
+            }
+            case "CONFIG" -> handleConfigClick(player,slot);
+        }
+    }
+
+    private void handleConfigClick(Player player,int slot){
+        if(!player.isOp()){closeUi(player);return;} if(slot==49){closeUi(player);return;}
+        if(slot==19){updateSettingUi(player,"behavior_watch_enabled",Boolean.toString(!settings.behaviorWatchEnabled));return;}
+        if(slot==21){updateSettingUi(player,"account_age_gate",Boolean.toString(!settings.accountAgeGate));return;}
+        if(slot==23){
+            int next=switch(settings.watchBaseRadius){case 64->96;case 96->128;case 128->160;case 160->192;default->64;};
+            updateSettingUi(player,"watch_base_radius",Integer.toString(next));return;
+        }
+        if(slot==25){
+            int next=switch(settings.watchGeoRadius){case 128->192;case 192->256;case 256->384;default->128;};
+            updateSettingUi(player,"watch_geo_radius",Integer.toString(next));return;
+        }
+        if(slot==28){String next=switch(settings.altMode){case "OFF"->"SAFE";case "SAFE"->"BALANCED";case "BALANCED"->"AGGRESSIVE";default->"OFF";};updateSettingUi(player,"alt_mode",next);return;}
+        if(slot==30){updateSettingUi(player,"require_reasons",Boolean.toString(!settings.requireReasons));return;}
+        if(slot==37){
+            int next=switch(settings.watchThreshold){case 35->45;case 45->55;case 55->65;default->35;};
+            updateSettingUi(player,"watch_threshold",Integer.toString(next));return;
+        }
+        if(slot==43){openWatchlistAsync(player,0);return;}
+        String type=switch(slot){case 10->"CONFIG_SERVER";case 12->"CONFIG_DISCORD";case 14->"CONFIG_MODGROUPS";case 16->"CONFIG_ALERTGROUPS";case 32->"CONFIG_MUTECMDS";default->null;};
+        if(type!=null){player.closeInventory();prompts.put(player.getUniqueId(),new Prompt(type,null,null,0L));player.sendMessage(PREFIX+switch(type){case "CONFIG_SERVER"->"§eType the server/network name.";case "CONFIG_DISCORD"->"§eType the Discord appeal URL.";case "CONFIG_MODGROUPS"->"§eType comma-separated LuckPerms moderator group names.";case "CONFIG_ALERTGROUPS"->"§eType comma-separated LuckPerms groups that receive alt alerts.";default->"§eType comma-separated command names muted players cannot use.";});}
+    }
+
+    private void updateSettingUi(Player player,String key,String value){Bukkit.getScheduler().runTaskAsynchronously(this,()->{try{database.setSetting(key,value);settings=Settings.load(database);sync(()->openConfig(player));}catch(Throwable t){asyncError(player,t);}});}
+
+    private void continueUiForTarget(Player player,String action,String target){
+        target=normalizeTarget(target);
+        if(Set.of("BAN","MUTE","BLACKLIST","WARN").contains(action)){openDuration(player,action,target);return;}
+        if(action.equals("HISTORY")){openHistoryAsync(player,target);return;}
+        if(action.equals("WARNINGS")){openWarningsAsync(player,target);return;}
+        if(action.equals("REMOVE")){openRemoveMenu(player,target);return;}
+        openReason(player,action,target,0L);
+    }
+
+    private void performUiAction(Player player,String action,String target,long duration,String reason){closeUi(player);submitPunishment(player,action,target,duration,reason);}
+    private void submitRevokeUi(Player player,String type,String target){closeUi(player);commandRevoke(player,type,new String[]{target},"/");}
+
+    private void revokeHistoryItem(Player player,Punishment p,String target){
+        if(!p.isActive(System.currentTimeMillis()))return;
+        if(!Set.of("BAN","MUTE","BLACKLIST","WARN").contains(p.type))return;
+        String modName=senderName(player), modDisplay=moderatorDisplay(player);
+        Bukkit.getScheduler().runTaskAsynchronously(this,()->{
+            try{
+                int changed=database.deactivatePunishmentById(p.id);
+                if(p.type.equals("BAN")) changed+=database.deactivateInheritedBansByParent(p.id);
+                if(changed>0) database.insertAudit("UN"+p.type,p.targetUuid,target,modName,modDisplay,"Removed from moderation history UI");
+                final int count=changed;
+                sync(()->{player.sendMessage(PREFIX+(count>0?"§aAction removed.":"§eThat action is no longer active."));openHistoryAsync(player,target);});
+            }catch(Throwable t){asyncError(player,t);}
+        });
+    }
+
+    private void handlePrompt(Player player,Prompt prompt,String input){
+        if(input.equalsIgnoreCase("cancel")){openMain(player);return;}
+        switch(prompt.type){
+            case "TARGET"->continueUiForTarget(player,prompt.action,input);
+            case "DURATION"->{long d=parseDuration(input);if(d==Long.MIN_VALUE||d==0){player.sendMessage(PREFIX+"§cInvalid duration. Try again from /moderate.");return;}openReason(player,prompt.action,prompt.target,d);}
+            case "REASON"->{if(settings.requireReasons&&input.isBlank()){player.sendMessage(PREFIX+"§cA reason is required.");return;}performUiAction(player,prompt.action,prompt.target,prompt.duration,normalizeReason(input));}
+            case "CONFIG_SERVER"->updateSettingUi(player,"server_name",limit(input,48));
+            case "CONFIG_DISCORD"->updateSettingUi(player,"discord_url",limit(input,255));
+            case "CONFIG_MODGROUPS"->updateSettingUi(player,"moderator_groups",normalizeCsv(input));
+            case "CONFIG_ALERTGROUPS"->updateSettingUi(player,"alert_groups",normalizeCsv(input));
+            case "CONFIG_MUTECMDS"->updateSettingUi(player,"mute_blocked_commands",normalizeCsv(input));
+        }
+    }
+
+    private void sendHistoryText(CommandSender sender,String target){UUID targetUuid=knownUuid(target);Bukkit.getScheduler().runTaskAsynchronously(this,()->{try{List<Punishment> list=database.history(targetUuid,target,30);sync(()->{sender.sendMessage(PREFIX+"§6History for §f"+target+"§6:");for(Punishment p:list)sender.sendMessage("§8- §f"+p.type+" §7"+formatDate(p.createdAt)+" §8• §f"+p.reason+" §8• "+(p.isActive(System.currentTimeMillis())?"§aACTIVE":"§8inactive"));});}catch(Throwable t){asyncError(sender,t);}});}
+    private void sendWarningsText(CommandSender sender,String target){UUID targetUuid=knownUuid(target);Bukkit.getScheduler().runTaskAsynchronously(this,()->{try{List<Punishment> list=database.activeWarnings(targetUuid,target);sync(()->{sender.sendMessage(PREFIX+"§eWarnings for §f"+target+"§e: §f"+list.size());for(Punishment p:list){String remaining=p.expiresAt==0?"forever":formatDuration(Math.max(0L,p.expiresAt-System.currentTimeMillis()));sender.sendMessage("§e⚠ §f"+p.id+" §7"+p.reason+" §8("+formatDate(p.createdAt)+", "+remaining+" remaining)");}});}catch(Throwable t){asyncError(sender,t);}});}
+
+    private void moderatorHelp(CommandSender sender){
+        sender.sendMessage("§6§lWorldsGreatestModeration §8• §fCommands");
+        sender.sendMessage("§e/moderate §7- Open the moderation control center");
+        sender.sendMessage("§e/ban <user> <duration> [reason]");
+        sender.sendMessage("§e/unban <user> [reason]");
+        sender.sendMessage("§e/mute <user> <duration> [reason]");
+        sender.sendMessage("§e/unmute <user> [reason]");
+        sender.sendMessage("§e/kick <user> [reason]");
+        sender.sendMessage("§e/blacklist <user> <duration> [reason]");
+        sender.sendMessage("§e/unblacklist <user> [reason]");
+        sender.sendMessage("§e/warn <user> <duration> [reason] §8• §e/unwarn <user> <id|all>");
+        sender.sendMessage("§e/warnings [user] §8• §e/viewmodhistory <user>");
+        sender.sendMessage("§e/watchlist §7- Review behavioral alt/evasion suspects (no automatic punishment)");
+        sender.sendMessage("§e/config §7- OP-only configuration UI");
+        sender.sendMessage("§7Durations: §f10s 10m 2h 3d 2w 1mo 1y forever §8(combinations supported)");
+    }
+
+    private boolean reasonAllowed(CommandSender sender,String reason){if(settings.requireReasons&&(reason==null||reason.isBlank())){sender.sendMessage(PREFIX+"§cA reason is required by configuration.");return false;}return true;}
+    private void noPermission(CommandSender sender){sender.sendMessage(PREFIX+"§cYou are not a configured moderator.");}
+
+    private boolean isModerator(CommandSender sender){
+        if(!(sender instanceof Player p))return true;
+        if(p.isOp()||p.hasPermission("worldsgreatestmoderation.moderator"))return true;
+        return lpInGroups(p,settings.moderatorGroups);
+    }
+    private boolean shouldReceiveAlert(Player p){return p.isOp()||p.hasPermission("worldsgreatestmoderation.alerts")||lpInGroups(p,settings.alertGroups);}
+
+    private boolean lpInGroups(Player player,Set<String> groups){
+        if(groups.isEmpty())return false;
+        try{
