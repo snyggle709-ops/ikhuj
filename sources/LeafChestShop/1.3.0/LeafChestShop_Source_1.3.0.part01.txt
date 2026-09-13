@@ -1,0 +1,168 @@
+age(PREFIX + "§aGave §f" + target.getName() + " §aa Tier " + tier + " Sell Wand.");
+        msg(target, "§aYou received a §eTier " + tier + " Sell Wand§a. §7Left-click one of your ChestShop signs to use it.");
+        return true;
+    }
+
+    private ItemStack createSellWand(int tier, int uses, String id) {
+        ItemStack wand = new ItemStack(Material.STICK, 1);
+        ItemMeta meta = wand.getItemMeta();
+        meta.setDisplayName("§6§lSell Wand §eTier " + tier);
+        List<String> lore = new ArrayList<>();
+        lore.add("§7Multiplier: §a" + sellWandMultiplierText(tier) + "x");
+        lore.add("§7Uses: §f" + uses + "§7/§f" + maxSellWandUses(tier));
+        lore.add("");
+        lore.add("§8Left-click your ChestShop sign to sell its contents.");
+        meta.setLore(lore);
+        meta.addEnchant(Enchantment.UNBREAKING, 1, true);
+        meta.addItemFlags(ItemFlag.HIDE_ENCHANTS);
+        meta.getPersistentDataContainer().set(sellWandTierKey, PersistentDataType.INTEGER, tier);
+        meta.getPersistentDataContainer().set(sellWandUsesKey, PersistentDataType.INTEGER, uses);
+        meta.getPersistentDataContainer().set(sellWandIdKey, PersistentDataType.STRING, id);
+        wand.setItemMeta(meta);
+        return wand;
+    }
+
+    private SellWandData readSellWand(ItemStack stack) {
+        if (stack == null || stack.getType() != Material.STICK || !stack.hasItemMeta()) return null;
+        ItemMeta meta = stack.getItemMeta();
+        Integer tier = meta.getPersistentDataContainer().get(sellWandTierKey, PersistentDataType.INTEGER);
+        Integer uses = meta.getPersistentDataContainer().get(sellWandUsesKey, PersistentDataType.INTEGER);
+        String id = meta.getPersistentDataContainer().get(sellWandIdKey, PersistentDataType.STRING);
+        if (tier == null || uses == null || id == null || id.isBlank()) return null;
+        if (tier < 1 || tier > 3 || uses <= 0 || uses > maxSellWandUses(tier)) return null;
+        return new SellWandData(tier, uses, id);
+    }
+
+    private int maxSellWandUses(int tier) {
+        return switch (tier) { case 1 -> 1000; case 2 -> 3000; case 3 -> 10000; default -> 0; };
+    }
+
+    private BigDecimal sellWandMultiplier(int tier) {
+        return switch (tier) { case 1 -> new BigDecimal("1.0"); case 2 -> new BigDecimal("1.5"); case 3 -> new BigDecimal("2.0"); default -> BigDecimal.ZERO; };
+    }
+
+    private String sellWandMultiplierText(int tier) {
+        return switch (tier) { case 1 -> "1.0"; case 2 -> "1.5"; case 3 -> "2.0"; default -> "0.0"; };
+    }
+
+    private void sellWandInstruction(Player player) {
+        msg(player, "§eUse this wand by §fleft-clicking a ChestShop sign that belongs to you§e.");
+    }
+
+    private void handleSellWandInteract(PlayerInteractEvent event, Player player, SellWandData wand) {
+        Action action = event.getAction();
+        if (action != Action.LEFT_CLICK_BLOCK && action != Action.RIGHT_CLICK_BLOCK && action != Action.LEFT_CLICK_AIR && action != Action.RIGHT_CLICK_AIR) return;
+        event.setCancelled(true);
+        if (action != Action.LEFT_CLICK_BLOCK) { sellWandInstruction(player); return; }
+        Block clicked = event.getClickedBlock();
+        if (clicked == null || !(clicked.getState() instanceof Sign)) { sellWandInstruction(player); return; }
+        Shop shop = shops.get(key(clicked.getLocation()));
+        if (shop == null) { sellWandInstruction(player); return; }
+        if (!isActualOwner(player, shop)) {
+            msg(player, "§cYou can only use a Sell Wand on a ChestShop sign that belongs to you.");
+            return;
+        }
+        sellOwnedChestWithWand(player, shop, wand);
+    }
+
+    private void sellOwnedChestWithWand(Player player, Shop shop, SellWandData wand) {
+        ReentrantLock lock = shopLocks.computeIfAbsent(shop.signKey, ignored -> new ReentrantLock());
+        if (!lock.tryLock()) { msg(player, "§eThat shop is busy. Try again."); return; }
+        try {
+            Container container = getContainer(shop);
+            if (container == null) { msg(player, "§cThe shop container is missing."); return; }
+            WorldsBestShopPricing pricing = loadWorldsBestShopPricing();
+            if (pricing == null) { msg(player, "§cWorldsBestShop pricing is unavailable."); return; }
+            if (!pricing.sellingEnabled) { msg(player, "§cSelling is disabled in WorldsBestShop."); return; }
+            if (!resolveEconomy()) { msg(player, "§cNo compatible Vault economy provider is available."); return; }
+
+            Inventory inventory = container.getInventory();
+            List<WandMutation> plan = new ArrayList<>();
+            Map<Material, Integer> soldAmounts = new LinkedHashMap<>();
+            Map<Material, BigDecimal> soldValues = new LinkedHashMap<>();
+            BigDecimal multiplier = sellWandMultiplier(wand.tier);
+            BigDecimal total = BigDecimal.ZERO;
+            int skipped = 0;
+            ItemStack[] contents = inventory.getStorageContents();
+            for (int slot = 0; slot < contents.length; slot++) {
+                ItemStack current = contents[slot];
+                if (current == null || current.getType().isAir() || current.getAmount() <= 0) continue;
+                BigDecimal unitPrice = pricing.sellPrices.get(current.getType());
+                if (unitPrice == null || !worldsBestShopSafeToSell(current, pricing.safety)) { skipped += current.getAmount(); continue; }
+                BigDecimal value = unitPrice.multiply(BigDecimal.valueOf(current.getAmount())).multiply(multiplier);
+                if (value.signum() <= 0) { skipped += current.getAmount(); continue; }
+                plan.add(new WandMutation(slot, current.clone()));
+                soldAmounts.merge(current.getType(), current.getAmount(), Integer::sum);
+                soldValues.merge(current.getType(), value, BigDecimal::add);
+                total = total.add(value);
+            }
+            if (plan.isEmpty()) {
+                if (skipped > 0) player.sendMessage("§cThis item is not sellable.");
+                else msg(player, "§eThere are no items to sell in this chest.");
+                return;
+            }
+            total = total.setScale(pricing.moneyDecimals, RoundingMode.HALF_UP);
+            if (total.signum() <= 0 || total.compareTo(pricing.minimumPayout) < 0) { msg(player, "§cThis sale is below the minimum payout."); return; }
+            if (total.compareTo(pricing.maximumTransactionValue) > 0 || !Double.isFinite(total.doubleValue())) { msg(player, "§cThis sale is too large."); return; }
+            for (WandMutation mutation : plan) {
+                if (!sameExact(inventory.getItem(mutation.slot), mutation.original)) { msg(player, "§eThe chest changed while selling. Try again."); return; }
+            }
+            for (WandMutation mutation : plan) inventory.setItem(mutation.slot, null);
+            if (!deposit(player, total.doubleValue())) {
+                boolean complete = true;
+                for (WandMutation mutation : plan) {
+                    ItemStack current = inventory.getItem(mutation.slot);
+                    if (current == null || current.getType().isAir()) inventory.setItem(mutation.slot, mutation.original.clone());
+                    else complete = false;
+                }
+                if (!complete) getLogger().severe("Could not safely restore every chest item after Sell Wand economy failure for " + player.getUniqueId());
+                msg(player, "§cPayment failed. The sale was rolled back.");
+                return;
+            }
+            consumeSellWandUse(player, wand);
+            for (Map.Entry<Material, Integer> entry : soldAmounts.entrySet()) {
+                BigDecimal value = soldValues.get(entry.getKey()).setScale(pricing.moneyDecimals, RoundingMode.HALF_UP);
+                player.sendMessage("§aSold §f" + entry.getValue() + "x " + prettyMaterial(entry.getKey()) + " §afor §2$" + dollar(value) + " §aat §e" + sellWandMultiplierText(wand.tier) + "x §amultiplier!");
+            }
+            if (skipped > 0) player.sendMessage("§eSkipped §f" + skipped + (skipped == 1 ? " item" : " items") + "§e: §cNot sellable.");
+        } finally { lock.unlock(); }
+    }
+
+    private void consumeSellWandUse(Player player, SellWandData wand) {
+        ItemStack held = player.getInventory().getItemInMainHand();
+        SellWandData current = readSellWand(held);
+        if (current == null || current.tier != wand.tier || !current.id.equals(wand.id)) return;
+        int remaining = current.uses - 1;
+        if (remaining <= 0) {
+            player.getInventory().setItemInMainHand(null);
+            msg(player, "§cYour Sell Wand ran out of uses.");
+            return;
+        }
+        player.getInventory().setItemInMainHand(createSellWand(current.tier, remaining, current.id));
+    }
+
+    private WorldsBestShopPricing loadWorldsBestShopPricing() {
+        try {
+            File worldsBestShopFolder = new File(getDataFolder().getParentFile(), "WorldsBestShop");
+            File catalogFile = new File(worldsBestShopFolder, "shop.yml");
+            File configFile = new File(worldsBestShopFolder, "config.yml");
+            if (!catalogFile.isFile() || !configFile.isFile()) return null;
+            YamlConfiguration catalog = YamlConfiguration.loadConfiguration(catalogFile);
+            YamlConfiguration config = YamlConfiguration.loadConfiguration(configFile);
+            ConfigurationSection categories = catalog.getConfigurationSection("categories");
+            if (categories == null) return null;
+            Map<Material, BigDecimal> sellPrices = new HashMap<>();
+            for (String categoryKey : categories.getKeys(false)) {
+                ConfigurationSection items = categories.getConfigurationSection(categoryKey + ".items");
+                if (items == null) continue;
+                for (String materialName : items.getKeys(false)) {
+                    Material material = Material.matchMaterial(materialName);
+                    if (material == null || !items.getBoolean(materialName + ".sell-enabled", true)) continue;
+                    String raw = items.getString(materialName + ".sell");
+                    if (raw == null) continue;
+                    try {
+                        BigDecimal price = new BigDecimal(raw.trim());
+                        if (price.signum() > 0) sellPrices.put(material, price);
+                    } catch (NumberFormatException ignored) {}
+                }
+       
