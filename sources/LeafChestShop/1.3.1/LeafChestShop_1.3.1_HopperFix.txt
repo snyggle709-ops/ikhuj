@@ -1,0 +1,38 @@
+LeafChestShop 1.3.1 hopper fix
+
+Base source: sources/LeafChestShop/1.3.0/
+
+Replace the 1.3.0 InventoryMoveItemEvent handler with:
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onInventoryMove(InventoryMoveItemEvent event) {
+        List<Shop> sourceShops = shopsForInventory(event.getSource());
+        if (!sourceShops.isEmpty()) {
+            // Never allow automation to extract from protected shop storage.
+            event.setCancelled(true);
+            return;
+        }
+
+        List<Shop> destinationShops = shopsForInventory(event.getDestination());
+        if (destinationShops.isEmpty()) return;
+
+        ItemStack moving = event.getItem();
+        boolean allowed = false;
+        for (Shop shop : destinationShops) {
+            // Hoppers may stock normal player-owned shops, but not unlimited/admin shops.
+            if (shop.admin || shop.item == null) continue;
+            if (moving != null && moving.getAmount() > 0 && moving.isSimilar(shop.item)) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) event.setCancelled(true);
+    }
+
+plugin.yml version changes from 1.3.0 to 1.3.1.
+
+Behavior:
+- Hopper insertion into a normal player-owned shop is allowed only for the shop's configured item.
+- Hopper extraction from any ChestShop container remains blocked.
+- Hopper insertion into admin/unlimited shops remains blocked.
+- Hopper insertion of unrelated items remains blocked.
