@@ -1,0 +1,110 @@
+            msg(player, "§cUsername must be 1-16 characters using letters, numbers, or underscore.");
+            return true;
+        }
+        ItemStack chest = specialChestItem(false, targetName, player);
+        if (!addSingleItem(player.getInventory(), chest)) {
+            msg(player, "§cYour inventory is full.");
+            return true;
+        }
+        msg(player, "§aChest given. The next shop created on that chest will belong to §f" + targetName + "§a, even if they have never joined.");
+        return true;
+    }
+
+    private boolean handleRate(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can rate sellers.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.rate")) {
+            msg(player, "§cYou do not have permission to rate sellers.");
+            return true;
+        }
+        if (args.length != 2) {
+            msg(player, "§eUsage: /rate <seller> <1-5>");
+            return true;
+        }
+        int score;
+        try {
+            score = Integer.parseInt(args[1]);
+        } catch (NumberFormatException ex) {
+            msg(player, "§cRating must be a whole number from 1 to 5.");
+            return true;
+        }
+        if (score < 1 || score > 5) {
+            msg(player, "§cRating must be from 1 to 5.");
+            return true;
+        }
+        OfflinePlayer target = findSeller(args[0]);
+        if (target == null) {
+            msg(player, "§cSeller not found. Use the seller name shown on a shop.");
+            return true;
+        }
+        if (args[0].equalsIgnoreCase(player.getName()) || target.getUniqueId().equals(player.getUniqueId())) {
+            msg(player, "§cYou cannot rate yourself.");
+            return true;
+        }
+        ratings.computeIfAbsent(target.getUniqueId(), k -> new HashMap<>()).put(player.getUniqueId(), score);
+        saveRatings();
+        RatingSummary summary = ratingSummary(target.getUniqueId());
+        msg(player, "§aRated §f" + sellerName(target) + " §a" + score + "/5. Overall: §f" + summary.display() + "§a.");
+        return true;
+    }
+
+    private boolean handleRating(CommandSender sender, String[] args) {
+        if (args.length != 1) {
+            sender.sendMessage(PREFIX + "§eUsage: /rating <seller>");
+            return true;
+        }
+        OfflinePlayer target = findSeller(args[0]);
+        if (target == null) {
+            sender.sendMessage(PREFIX + "§cSeller not found. Use the seller name shown on a shop.");
+            return true;
+        }
+        RatingSummary summary = ratingSummary(target.getUniqueId());
+        sender.sendMessage(PREFIX + "§f" + sellerName(target) + "§r rating: §e" + summary.display() + "§r.");
+        return true;
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onSignChange(SignChangeEvent event) {
+        String signKey = key(event.getBlock().getLocation());
+        Shop existing = shops.get(signKey);
+        Player player = event.getPlayer();
+        boolean editing = existing != null && signKey.equals(pendingEdits.remove(player.getUniqueId()));
+
+        if (existing != null && !editing) {
+            event.setCancelled(true);
+            msg(player, "§cThis shop sign is protected. Owners can sneak + right-click it to edit.");
+            return;
+        }
+
+        if (editing) {
+            handleFriendlyShopEdit(event, player, existing);
+            return;
+        }
+
+        String header = clean(event.getLine(0));
+        if (!header.equalsIgnoreCase("[shop]") && !header.equalsIgnoreCase("[adminshop]")) {
+            return;
+        }
+        if (!player.hasPermission("leafchestshop.create")) {
+            event.setCancelled(true);
+            msg(player, "§cYou do not have permission to create shops.");
+            return;
+        }
+
+        Block signBlock = event.getBlock();
+        Block containerBlock = attachedContainer(signBlock);
+        if (containerBlock == null || !(containerBlock.getState() instanceof Container containerState) || !isAllowedShopContainer(containerBlock)) {
+            event.setCancelled(true);
+            msg(player, "§cThe sign must be attached to a chest, trapped chest, or barrel.");
+            return;
+        }
+        if (!shopsForInventory(containerState.getInventory()).isEmpty()) {
+            event.setCancelled(true);
+            msg(player, "§cThat container already has a shop attached.");
+            return;
+        }
+
+        PreparedMatch preparedMatch = findPrepared(containerState);
+        PreparedChest prepared = prepare
