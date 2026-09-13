@@ -1,0 +1,110 @@
+nt amount, double buy, double sell, ItemStack item) {
+            this.signKey = signKey;
+            this.containerKey = containerKey;
+            this.owner = owner;
+            this.ownerName = ownerName;
+            this.admin = admin;
+            this.createdByAdmin = createdByAdmin;
+            this.creator = creator;
+            this.creatorName = creatorName;
+            this.amount = amount;
+            this.buy = buy;
+            this.sell = sell;
+            this.item = item == null ? null : item.clone();
+            if (this.item != null) this.item.setAmount(1);
+        }
+    }
+
+    private static final class PreparedChest {
+        final boolean admin;
+        final String ownerName;
+        final UUID creator;
+        final String creatorName;
+
+        PreparedChest(boolean admin, String ownerName, UUID creator, String creatorName) {
+            this.admin = admin;
+            this.ownerName = ownerName;
+            this.creator = creator;
+            this.creatorName = creatorName;
+        }
+
+        boolean isCreator(Player player) {
+            if (creator != null && creator.equals(player.getUniqueId())) return true;
+            return creatorName != null && creatorName.equalsIgnoreCase(player.getName());
+        }
+    }
+
+    private static final class PreparedMatch {
+        final String containerKey;
+        final PreparedChest prepared;
+        PreparedMatch(String containerKey, PreparedChest prepared) {
+            this.containerKey = containerKey;
+            this.prepared = prepared;
+        }
+    }
+
+    private static final class SpecialChestData {
+        final boolean admin;
+        final String ownerName;
+        final UUID creator;
+        final String creatorName;
+        SpecialChestData(boolean admin, String ownerName, UUID creator, String creatorName) {
+            this.admin = admin;
+            this.ownerName = ownerName;
+            this.creator = creator;
+            this.creatorName = creatorName;
+        }
+    }
+
+}
+
+
+===== plugin.yml =====
+name: LeafChestShop
+version: 1.3.0
+main: dev.leafchestshop.LeafChestShop
+api-version: '1.21'
+softdepend: [Vault, VaultUnlocked]
+description: Secure sign-and-container chest shops for Leaf/Paper 1.21.4 with Vault economy support.
+commands:
+  leafchestshop:
+    aliases: [lcs]
+    description: Chest shop commands
+    usage: /lcs help
+  rate:
+    description: Rate a chest shop seller from 1 to 5
+    usage: /rate <seller> <1-5>
+  rating:
+    description: View a chest shop seller rating
+    usage: /rating <seller>
+  viewadminchestshops:
+    description: Browse all chest shops created by admins
+    usage: /viewadminchestshops
+  adminchestshop:
+    description: Receive an unlimited-stock admin chest shop item
+    usage: /adminchestshop
+  chestshop:
+    description: Admin chest shop ownership tools
+    usage: /chestshop create <username>
+  givesellwand:
+    description: Give a tiered WorldsBestShop sell wand
+    usage: /givesellwand tier <1-3> <username>
+permissions:
+  leafchestshop.use:
+    description: Use chest shops
+    default: true
+  leafchestshop.create:
+    description: Create and edit player chest shops
+    default: true
+  leafchestshop.rate:
+    description: Rate chest shop sellers
+    default: true
+  leafchestshop.admin:
+    description: Create admin shops and administer the plugin
+    default: op
+  leafchestshop.givesellwand:
+    description: Give sell wands
+    default: op
+  leafchestshop.bypass:
+    description: Bypass shop protection
+    default: op
