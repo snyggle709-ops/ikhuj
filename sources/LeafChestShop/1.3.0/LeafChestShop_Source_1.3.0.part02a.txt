@@ -1,0 +1,110 @@
+     }
+            WorldsBestShopSafety safety = new WorldsBestShopSafety(
+                    config.getBoolean("safety.reject-any-item-meta", true), config.getBoolean("safety.reject-overstacked-items", true),
+                    config.getBoolean("safety.reject-container-like-materials", true), config.getBoolean("safety.reject-damaged-items", true),
+                    config.getBoolean("safety.reject-enchanted-items", true), config.getBoolean("safety.reject-custom-named-items", true),
+                    config.getBoolean("safety.reject-lore-items", true), config.getBoolean("safety.reject-persistent-data-items", true),
+                    config.getBoolean("safety.reject-custom-model-data-items", true));
+            int decimals = Math.max(0, Math.min(8, config.getInt("money.decimals", 2)));
+            BigDecimal minimum = readDecimal(config, "money.minimum-payout", new BigDecimal("0.01"));
+            BigDecimal maximum = readDecimal(config, "money.maximum-transaction-value", new BigDecimal("1000000000000.00"));
+            return new WorldsBestShopPricing(sellPrices, safety, decimals, minimum, maximum, config.getBoolean("shop.selling-enabled", true));
+        } catch (Throwable t) {
+            getLogger().warning("Could not read WorldsBestShop pricing: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            return null;
+        }
+    }
+
+    private BigDecimal readDecimal(YamlConfiguration config, String path, BigDecimal fallback) {
+        String raw = config.getString(path);
+        if (raw == null) return fallback;
+        try { return new BigDecimal(raw.trim()); } catch (NumberFormatException ex) { return fallback; }
+    }
+
+    private boolean worldsBestShopSafeToSell(ItemStack stack, WorldsBestShopSafety safety) {
+        if (stack == null || stack.getType().isAir() || stack.getAmount() <= 0) return false;
+        Material type = stack.getType();
+        if (safety.rejectOverstacked && stack.getAmount() > type.getMaxStackSize()) return false;
+        if (safety.rejectContainerLike && isWorldsBestShopContainerLike(type)) return false;
+        if (!stack.hasItemMeta()) return true;
+        if (safety.rejectAnyMeta) return false;
+        ItemMeta meta = stack.getItemMeta();
+        if (safety.rejectCustomNamed && meta.hasCustomName()) return false;
+        if (safety.rejectLore && meta.hasLore()) return false;
+        if (safety.rejectEnchanted && meta.hasEnchants()) return false;
+        if (safety.rejectPersistentData && !meta.getPersistentDataContainer().isEmpty()) return false;
+        if (safety.rejectCustomModelData && meta.hasCustomModelData()) return false;
+        if (safety.rejectDamaged && meta instanceof Damageable damageable && damageable.getDamage() > 0) return false;
+        return true;
+    }
+
+    private boolean isWorldsBestShopContainerLike(Material material) {
+        String name = material.name();
+        return name.equals("BUNDLE") || name.endsWith("_SHULKER_BOX") || name.equals("CHEST") || name.equals("TRAPPED_CHEST") || name.equals("BARREL");
+    }
+
+    private static boolean sameExact(ItemStack a, ItemStack b) {
+        if (a == null || a.getType().isAir()) return b == null || b.getType().isAir();
+        if (b == null || b.getType().isAir()) return false;
+        return a.getAmount() == b.getAmount() && a.isSimilar(b);
+    }
+
+    private static String prettyMaterial(Material material) {
+        String raw = material.name().toLowerCase(Locale.ROOT).replace('_', ' ');
+        StringBuilder result = new StringBuilder(raw.length());
+        boolean upper = true;
+        for (char c : raw.toCharArray()) {
+            if (upper && Character.isLetter(c)) { result.append(Character.toUpperCase(c)); upper = false; }
+            else { result.append(c); if (c == ' ') upper = true; }
+        }
+        return result.toString();
+    }
+
+    private static String dollar(BigDecimal value) { return value.setScale(2, RoundingMode.HALF_UP).toPlainString(); }
+
+    private boolean handleViewAdminShops(CommandSender sender) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can open the admin shop browser.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.admin")) {
+            msg(player, "§cNo permission.");
+            return true;
+        }
+        openAdminShopBrowser(player, 0);
+        return true;
+    }
+
+    private boolean handleAdminChestShop(CommandSender sender) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can receive an admin shop chest.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.admin")) {
+            msg(player, "§cNo permission.");
+            return true;
+        }
+        ItemStack chest = specialChestItem(true, null, player);
+        if (!addSingleItem(player.getInventory(), chest)) {
+            msg(player, "§cYour inventory is full.");
+            return true;
+        }
+        msg(player, "§aAdmin chest shop given. Place it, attach a wall sign, and create the shop normally. Its stock will be unlimited.");
+        return true;
+    }
+
+    private boolean handleChestShopCommand(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + "Only players can use this command.");
+            return true;
+        }
+        if (!player.hasPermission("leafchestshop.admin")) {
+            msg(player, "§cNo permission.");
+            return true;
+        }
+        if (args.length != 2 || !args[0].equalsIgnoreCase("create")) {
+            msg(player, "§eUsage: /chestshop create <username>");
+            return true;
+        }
+        String targetName = args[1].trim();
+        if (!targetName.matches("[A-Za-z0-9_]{1,16}")) {
